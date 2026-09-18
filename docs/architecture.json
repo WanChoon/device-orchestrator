@@ -1,0 +1,435 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "device-orchestrator",
+    "output": "orchestrator.html",
+    "quality_profile": "showcase",
+    "views": [
+      {
+        "id": "dispatch",
+        "label": "Dispatch path",
+        "focus": [
+          "client",
+          "api",
+          "queue",
+          "sched",
+          "registry",
+          "contract",
+          "android",
+          "web"
+        ],
+        "note": "One shared queue. The device is picked when a worker leases it, not at submit time, so a retry lands on different hardware."
+      },
+      {
+        "id": "failure",
+        "label": "When a device wedges",
+        "focus": [
+          "sched",
+          "health",
+          "registry",
+          "sessions",
+          "adb"
+        ],
+        "note": "The probe is a real adb round trip on a short deadline: a wedged device accepts TCP then answers nothing."
+      },
+      {
+        "id": "contract",
+        "label": "One contract, two backends",
+        "focus": [
+          "contract",
+          "android",
+          "web",
+          "phone",
+          "browser"
+        ],
+        "note": "core/ never imports a target. A browser slot is a device with transport=virtual, so leases and selectors need no special case."
+      },
+      {
+        "id": "observability",
+        "label": "Progress and logs",
+        "focus": [
+          "sched",
+          "hub",
+          "ws",
+          "log"
+        ],
+        "note": "One correlation id per task, inherited through asyncio context. Fan-out is bounded per subscriber, oldest-first."
+      }
+    ]
+  },
+  "components": [
+    {
+      "id": "client",
+      "type": "external",
+      "label": "Client",
+      "sublabel": "CLI / HTTP",
+      "pos": [
+        30,
+        300
+      ],
+      "size": [
+        120,
+        60
+      ]
+    },
+    {
+      "id": "api",
+      "type": "frontend",
+      "label": "FastAPI",
+      "sublabel": "api/server.py",
+      "pos": [
+        195,
+        300
+      ],
+      "size": [
+        130,
+        60
+      ]
+    },
+    {
+      "id": "ws",
+      "type": "external",
+      "label": "Dashboard",
+      "sublabel": "WS client",
+      "pos": [
+        30,
+        520
+      ],
+      "size": [
+        120,
+        60
+      ]
+    },
+    {
+      "id": "hub",
+      "type": "messagebus",
+      "label": "EventHub",
+      "sublabel": "api/ws.py",
+      "pos": [
+        195,
+        520
+      ],
+      "size": [
+        130,
+        60
+      ]
+    },
+    {
+      "id": "queue",
+      "type": "messagebus",
+      "label": "Task queue",
+      "sublabel": "asyncio.Queue",
+      "pos": [
+        375,
+        120
+      ],
+      "size": [
+        130,
+        60
+      ]
+    },
+    {
+      "id": "sched",
+      "type": "backend",
+      "label": "Scheduler",
+      "sublabel": "worker pool",
+      "pos": [
+        375,
+        300
+      ],
+      "size": [
+        130,
+        60
+      ]
+    },
+    {
+      "id": "log",
+      "type": "database",
+      "label": "JSON log",
+      "sublabel": "obs/log.py",
+      "pos": [
+        375,
+        520
+      ],
+      "size": [
+        130,
+        60
+      ],
+      "tag": "correlation id"
+    },
+    {
+      "id": "sessions",
+      "type": "backend",
+      "label": "SessionManager",
+      "sublabel": "reconnect",
+      "pos": [
+        565,
+        120
+      ],
+      "size": [
+        140,
+        60
+      ]
+    },
+    {
+      "id": "registry",
+      "type": "database",
+      "label": "DeviceRegistry",
+      "sublabel": "leases",
+      "pos": [
+        565,
+        300
+      ],
+      "size": [
+        140,
+        60
+      ],
+      "tag": "late binding"
+    },
+    {
+      "id": "contract",
+      "type": "security",
+      "label": "Target contract",
+      "sublabel": "core/task.py",
+      "pos": [
+        755,
+        300
+      ],
+      "size": [
+        140,
+        60
+      ],
+      "tag": "one interface"
+    },
+    {
+      "id": "android",
+      "type": "backend",
+      "label": "AndroidTarget",
+      "sublabel": "targets/",
+      "pos": [
+        1000,
+        170
+      ],
+      "size": [
+        140,
+        60
+      ]
+    },
+    {
+      "id": "web",
+      "type": "backend",
+      "label": "WebTarget",
+      "sublabel": "targets/",
+      "pos": [
+        1000,
+        430
+      ],
+      "size": [
+        140,
+        60
+      ]
+    },
+    {
+      "id": "phone",
+      "type": "external",
+      "label": "Android device",
+      "sublabel": "usb/tcp/tunnel",
+      "pos": [
+        1190,
+        170
+      ],
+      "size": [
+        140,
+        64
+      ]
+    },
+    {
+      "id": "browser",
+      "type": "external",
+      "label": "Browser slot",
+      "sublabel": "virtual",
+      "pos": [
+        1190,
+        430
+      ],
+      "size": [
+        140,
+        64
+      ]
+    },
+    {
+      "id": "health",
+      "type": "security",
+      "label": "HealthMonitor",
+      "sublabel": "quarantine",
+      "pos": [
+        565,
+        700
+      ],
+      "size": [
+        150,
+        64
+      ]
+    },
+    {
+      "id": "adb",
+      "type": "cloud",
+      "label": "adb",
+      "sublabel": "subprocess",
+      "pos": [
+        800,
+        700
+      ],
+      "size": [
+        140,
+        64
+      ]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "core/ — no import of Appium, Playwright or HTTP",
+      "wraps": [
+        "queue",
+        "sched",
+        "registry",
+        "sessions",
+        "contract"
+      ]
+    },
+    {
+      "kind": "region",
+      "label": "targets/ — two backends, one contract",
+      "wraps": [
+        "android",
+        "web"
+      ]
+    }
+  ],
+  "connections": [
+    {
+      "id": "submit",
+      "from": "client",
+      "to": "api",
+      "label": "TaskSpec",
+      "variant": "emphasis"
+    },
+    {
+      "id": "enqueue",
+      "from": "api",
+      "to": "queue",
+      "label": "submit"
+    },
+    {
+      "id": "dequeue",
+      "from": "queue",
+      "to": "sched"
+    },
+    {
+      "id": "session",
+      "from": "sched",
+      "to": "sessions",
+      "label": "ensure()"
+    },
+    {
+      "id": "lease",
+      "from": "sched",
+      "to": "registry",
+      "label": "acquire lease",
+      "variant": "emphasis",
+      "labelDy": 47
+    },
+    {
+      "id": "execute",
+      "from": "registry",
+      "to": "contract",
+      "label": "execute()",
+      "variant": "emphasis"
+    },
+    {
+      "id": "to-android",
+      "from": "contract",
+      "to": "android",
+      "fromSide": "right",
+      "toSide": "left",
+      "via": [
+        [
+          945,
+          330
+        ],
+        [
+          945,
+          200
+        ]
+      ]
+    },
+    {
+      "id": "to-web",
+      "from": "contract",
+      "to": "web",
+      "fromSide": "right",
+      "toSide": "left",
+      "via": [
+        [
+          965,
+          330
+        ],
+        [
+          965,
+          460
+        ]
+      ]
+    },
+    {
+      "id": "android-phone",
+      "from": "android",
+      "to": "phone",
+      "label": "Appium W3C",
+      "labelDy": 54
+    },
+    {
+      "id": "web-browser",
+      "from": "web",
+      "to": "browser",
+      "label": "Playwright",
+      "labelDy": -24
+    },
+    {
+      "id": "probe",
+      "from": "health",
+      "to": "adb",
+      "label": "adb shell true, 2s",
+      "variant": "security",
+      "labelDy": 56
+    },
+    {
+      "id": "quarantine",
+      "from": "health",
+      "to": "registry",
+      "label": "quarantine / retire",
+      "variant": "security",
+      "fromSide": "top",
+      "toSide": "bottom"
+    },
+    {
+      "id": "events",
+      "from": "sched",
+      "to": "hub",
+      "label": "progress"
+    },
+    {
+      "id": "fanout",
+      "from": "hub",
+      "to": "ws",
+      "variant": "emphasis"
+    },
+    {
+      "id": "logs",
+      "from": "sched",
+      "to": "log",
+      "variant": "dashed"
+    }
+  ]
+}

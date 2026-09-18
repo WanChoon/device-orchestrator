@@ -18,6 +18,29 @@ It is the fastest way to see what this project is actually about, which is not
 This document is about why the code is shaped this way. What each module does is
 in the module docstrings.
 
+```mermaid
+flowchart LR
+    client["CLI / HTTP"] --> api["FastAPI<br/>api/server.py"]
+    api --> queue[["Task queue<br/>asyncio.Queue"]]
+    queue --> sched["Scheduler<br/>worker pool"]
+    sched -->|acquire lease| reg[("DeviceRegistry<br/>late binding")]
+    sched -->|ensure| sess["SessionManager<br/>reconnect"]
+    reg --> contract{{"Target contract<br/>core/task.py"}}
+    contract --> android["AndroidTarget"]
+    contract --> web["WebTarget"]
+    android -->|Appium W3C| phone(["Android device<br/>usb / tcp / tunnel"])
+    web -->|Playwright| slot(["Browser slot<br/>transport=virtual"])
+    sched -.->|retry, jittered| queue
+    sched --> hub[["EventHub"]] --> ws(["WS /ws/progress"])
+    health["HealthMonitor<br/>quarantine / retire"] -->|adb shell true, 2s| adb["adb<br/>bounded subprocess"]
+    health -->|unassignable| reg
+```
+
+Everything left of `Target contract` is `core/`, and it imports neither Appium,
+Playwright nor HTTP. A browser slot is registered as a device with
+`transport="virtual"`, so leases, selectors and concurrency limits work on
+browsers with no special case anywhere in `core/`.
+
 ---
 
 ## Why the modules are split where they are
