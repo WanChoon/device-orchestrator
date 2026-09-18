@@ -207,6 +207,22 @@ cheap and interacts badly with everything around it: a step that retries five
 times inside a task with a 120s deadline has silently spent the task's entire
 budget without telling the scheduler. One budget, enforced in one place.
 
+**No exactly-once semantics — retries are at-least-once, and that is a real
+limitation.** When a task times out, the scheduler cannot tell whether the
+target got far enough to cause a side effect on the device before it was
+cancelled. It retries anyway. For idempotent work that is correct; for work with
+external side effects it is not, and no amount of retry tuning fixes it.
+
+The honest fix is not more retries, it is a state distinction: an interrupted
+unit of work that never started and one that was already running deserve
+*opposite* treatment, and only the second one carries evidence that something
+happened. The error taxonomy in `core/task.py` is where that distinction would
+live — `RetryableError` already separates "the app misbehaved" from "the device
+died", and a third case ("it may have taken effect") is the missing one. It is
+missing because getting it right needs a claim/settle handshake with the target,
+and inventing that protocol against a fake driver would be designing for a
+workload I have not measured.
+
 **No screenshot/artifact pipeline.** It is the obvious next thing and it is
 mostly plumbing — upload, retention, a URL in the result dict. It would have
 added the most lines and demonstrated the least about orchestration.
