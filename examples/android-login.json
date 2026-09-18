@@ -1,0 +1,27 @@
+[
+  {
+    "id": "android-smoke",
+    "kind": "android",
+    "selector": { "tags": ["android"] },
+    "timeout_s": 60,
+    "max_attempts": 3,
+    "steps": [
+      { "op": "tap", "id": "com.example.app:id/sign_in" },
+      { "op": "type", "id": "com.example.app:id/username", "text": "demo-user" },
+      { "op": "type", "id": "com.example.app:id/password", "text": "demo-pass" },
+      { "op": "tap", "accessibility_id": "Continue" },
+      { "op": "wait", "seconds": 1 },
+      { "op": "read", "id": "com.example.app:id/status", "into": "status" }
+    ]
+  },
+  {
+    "id": "web-smoke",
+    "kind": "web",
+    "selector": { "tags": ["web"] },
+    "timeout_s": 60,
+    "steps": [
+      { "op": "goto", "url": "https://example.com/" },
+      { "op": "read", "selector": "h1", "into": "heading" }
+    ]
+  }
+]

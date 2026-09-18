@@ -1,0 +1,7 @@
+# Runtime. Deliberately short.
+fastapi>=0.110
+uvicorn[standard]>=0.27
+
+# Optional, for the web target. Without it targets/web.py falls back to an
+# in-process fake driver and the orchestration still runs end to end.
+# playwright>=1.42
