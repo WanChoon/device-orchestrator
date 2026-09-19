@@ -162,12 +162,147 @@
   button.primary { border-color: var(--online); color: var(--online); background: var(--online-wash); }
   button.danger  { border-color: var(--bad); color: var(--bad); background: var(--bad-wash); }
 
+  .iconbtn {
+    width: 26px;
+    height: 26px;
+    padding: 0;
+    border-radius: 50%;
+    font-size: 14px;
+    line-height: 1;
+    font-weight: 600;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }
+
   .warn {
     width: 100%;
     font-family: var(--mono);
     font-size: 12px;
     color: var(--bad);
   }
+
+  /* ---------------------------------------------------------- help overlay */
+
+  .overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, .55);
+    display: flex;
+    align-items: flex-start;
+    justify-content: center;
+    padding: max(24px, env(safe-area-inset-top, 0px)) 16px 24px;
+    overflow-y: auto;
+    z-index: 50;
+  }
+  .sheet-card {
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-radius: 8px;
+    max-width: 640px;
+    width: 100%;
+    margin: auto;
+    box-shadow: 0 12px 40px rgba(0, 0, 0, .35);
+  }
+  .sheet-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 16px 20px;
+    border-bottom: 1px solid var(--rule);
+    position: sticky;
+    top: 0;
+    background: var(--surface);
+    border-radius: 8px 8px 0 0;
+  }
+  .sheet-head h2 {
+    margin: 0;
+    padding: 0;
+    border: 0;
+    font-size: 16px;
+    color: var(--ink);
+    background: none;
+    text-transform: none;
+    letter-spacing: 0;
+  }
+  .sheet-body { padding: 18px 20px 22px; }
+  .sheet-body .lede {
+    font-size: 14.5px;
+    line-height: 1.55;
+    color: var(--ink-mid);
+    margin: 0 0 16px;
+  }
+  .sheet-body .lede b { color: var(--ink); }
+
+  .walk {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+    counter-reset: walk;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+  }
+  .walk li {
+    position: relative;
+    padding-left: 34px;
+    font-size: 14px;
+    line-height: 1.55;
+    color: var(--ink-mid);
+  }
+  .walk li::before {
+    counter-increment: walk;
+    content: counter(walk);
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 22px;
+    height: 22px;
+    border-radius: 50%;
+    background: var(--sunk);
+    color: var(--ink);
+    font-family: var(--mono);
+    font-size: 12px;
+    font-weight: 600;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .walk li b { color: var(--ink); }
+  .walk li i { color: var(--ink-mid); }
+
+  .kbd {
+    display: inline-block;
+    font-family: var(--mono);
+    font-size: 11.5px;
+    padding: 1px 6px;
+    border-radius: 4px;
+    border: 1px solid var(--online);
+    color: var(--online);
+    background: var(--online-wash);
+    white-space: nowrap;
+  }
+  .kbd.danger-kbd { border-color: var(--bad); color: var(--bad); background: var(--bad-wash); }
+  .mono {
+    font-family: var(--mono);
+    font-size: .9em;
+    background: var(--sunk);
+    padding: 0 4px;
+    border-radius: 3px;
+    color: var(--ink);
+  }
+
+  .sheet-body .foot {
+    margin: 18px 0 0;
+    padding-top: 14px;
+    border-top: 1px solid var(--rule);
+    font-size: 13px;
+    line-height: 1.55;
+    color: var(--ink-mute);
+  }
+  .sheet-body .foot b { color: var(--ink-mid); }
+  #guide-got-it { margin-top: 18px; width: 100%; padding: 10px; font-size: 13px; }
 
   /* ---------------------------------------------------------- layout */
 
@@ -351,6 +486,7 @@
     </div>
 
     <button id="run" class="primary" type="button">Run scenario</button>
+    <button id="help" class="iconbtn" type="button" aria-label="How this works" title="How this works">?</button>
     <span id="link" class="link"><span class="dot"></span><span id="link-text">connecting</span></span>
     <p id="warn" class="warn" hidden></p>
   </header>
@@ -391,6 +527,69 @@
     </div>
   </section>
 
+</div>
+
+<div id="guide" class="overlay" hidden>
+  <div class="sheet-card" role="dialog" aria-modal="true" aria-labelledby="guide-title">
+    <div class="sheet-head">
+      <h2 id="guide-title">What this is, and how to read it</h2>
+      <button id="guide-close" class="iconbtn" type="button" aria-label="Close">×</button>
+    </div>
+
+    <div class="sheet-body">
+      <p class="lede">
+        This is not "watch a phone get driven" — it is <b>what happens to a queue of work
+        when a device stops answering</b>. The whole console is built to make that gap
+        visible. Everything runs in-process: no real phone, Appium, or browser.
+      </p>
+
+      <ol class="walk">
+        <li>
+          <b>Click <span class="kbd">Run scenario</span>.</b>
+          A batch of tasks is queued across the fleet — three phones and two browser slots.
+          Watch the <b>Tasks</b> table fill and the <b>running / queued</b> counters move.
+          One task targets a device that does not exist, so it lands in
+          <span class="mono">abandoned</span> on purpose: "queued forever" and "impossible"
+          should not look the same.
+        </li>
+        <li>
+          <b>While it runs, pick a phone and click <span class="kbd danger-kbd">stop answering</span>.</b>
+          Now watch what <i>doesn't</i> happen. The phone keeps its
+          <span class="mono">online</span> tag and a red <span class="mono">not answering</span>
+          badge appears, with a counter: <i>silent for 2.4s — the system has not noticed yet</i>.
+          It is still online because it genuinely still is assignable; nothing has found out.
+          <b>That gap is the whole point.</b>
+        </li>
+        <li>
+          <b>Wait a moment — it flips to <span class="mono">quarantined</span>.</b>
+          The counter freezes at how long detection took. Two paths: a phone with a task on it
+          fails in under a second and blames the device; an idle one is caught by the health
+          probe in ~4s. In the <b>Tasks</b> table, the task that was on it now shows a second
+          attempt on a <i>different</i> device — nobody routed it there, it just went back on
+          the shared queue.
+        </li>
+        <li>
+          <b>Click <span class="kbd">revive</span>.</b>
+          The next health probe succeeds, the device returns to <span class="mono">online</span>,
+          and its recovery count ticks up. Leave a phone dark instead and the failed recoveries
+          back off (8s, 16s, 32s…) rather than flooding the feed — and after enough recoveries
+          in a window a device <span class="mono">retires</span> itself instead of coming back,
+          because a device that needs saving every few minutes is not recovering, it is
+          oscillating.
+        </li>
+      </ol>
+
+      <p class="foot">
+        The <b>Event stream</b> is live over WebSocket; your action
+        (<span class="mono">demo.darkened</span>) and the system's reaction
+        (<span class="mono">device.quarantined</span>) share one timeline, so you can always
+        tell whether you caused something or it just happened. Device and task state are also
+        polled, so the panels stay correct even if the feed drops an event under load.
+      </p>
+
+      <button id="guide-got-it" class="primary" type="button">Got it — let me try</button>
+    </div>
+  </div>
 </div>
 
 <script>
@@ -701,6 +900,36 @@
     }
     refresh();
   }
+
+  // --- help overlay -------------------------------------------------------
+
+  const GUIDE_SEEN = "orch.guide.seen";
+
+  function openGuide() {
+    $("guide").hidden = false;
+  }
+  function closeGuide() {
+    $("guide").hidden = true;
+    // Remembered per viewer so it auto-opens once and never nags again. The
+    // "?" button reopens it on demand. localStorage can throw in a private
+    // window, so the try/catch keeps the console working without it -- the only
+    // cost is the guide opening again next visit.
+    try { localStorage.setItem(GUIDE_SEEN, "1"); } catch (e) { /* ignore */ }
+  }
+
+  $("help").addEventListener("click", openGuide);
+  $("guide-close").addEventListener("click", closeGuide);
+  $("guide-got-it").addEventListener("click", closeGuide);
+  $("guide").addEventListener("click", (e) => {
+    if (e.target === $("guide")) closeGuide();   // click the backdrop to dismiss
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && !$("guide").hidden) closeGuide();
+  });
+
+  let firstVisit = true;
+  try { firstVisit = localStorage.getItem(GUIDE_SEEN) !== "1"; } catch (e) { /* ignore */ }
+  if (firstVisit) openGuide();
 
   $("run").addEventListener("click", () => post("demo/scenario"));
 

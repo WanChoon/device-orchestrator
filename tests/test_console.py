@@ -113,6 +113,31 @@ class DashboardFileTests(unittest.TestCase):
     def test_it_acknowledges_a_click_before_the_round_trip(self) -> None:
         self.assertIn("silencedAt.set", self.html)
 
+    def test_it_ships_a_help_overlay(self) -> None:
+        # A stranger opening the console cold should be told what to click and
+        # what to expect, without reading the source.
+        self.assertIn('id="help"', self.html)
+        self.assertIn('id="guide"', self.html)
+        for word in ("Run scenario", "stop answering", "revive"):
+            self.assertIn(word, self.html, f"help overlay never mentions {word!r}")
+
+    def test_the_help_overlay_starts_hidden_and_opens_on_first_visit(self) -> None:
+        # It must be hidden in the served HTML -- a thumbnail or a returning
+        # viewer should not get a modal in the face -- and opened by script only
+        # when localStorage says this viewer has not seen it.
+        self.assertIn('<div id="guide" class="overlay" hidden>', self.html)
+        self.assertIn("GUIDE_SEEN", self.html)
+        self.assertIn("openGuide", self.html)
+
+    def test_localStorage_access_is_guarded(self) -> None:
+        # localStorage throws in a private window; the console must still work.
+        # Every access has to sit inside a try, or one private-window viewer
+        # gets a blank page. Checked per line so it survives reformatting.
+        uses = [ln for ln in self.html.splitlines() if "localStorage." in ln]
+        self.assertTrue(uses, "expected the console to use localStorage")
+        for line in uses:
+            self.assertIn("try {", line, f"unguarded localStorage access: {line.strip()}")
+
     def test_device_rows_are_patched_not_rebuilt(self) -> None:
         """A click needs mousedown and mouseup on the same element.
 
