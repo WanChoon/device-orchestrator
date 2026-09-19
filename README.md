@@ -9,7 +9,7 @@ working unattended, and reports progress over WebSocket.
 ```bash
 python cli.py demo                    # full run: no install, no adb, no Appium, no browser
 python cli.py deploy --fake           # APK rollout across a fleet, no phone needed
-python -m unittest discover -s tests  # 65 tests, ~5s
+python -m unittest discover -s tests  # 70 tests, ~5s
 
 pip install -r requirements.txt       # only `serve` needs anything
 python cli.py serve --fake            # live console on http://127.0.0.1:8080/
@@ -303,33 +303,59 @@ key and asking a KMS. `SecretBox` is the single seam either answer plugs into.
 
 ## The console
 
-`serve` publishes a single-file page at `/` that renders the fleet live. It is
-worth describing because of one decision that is easy to get backwards.
+`serve` publishes a single-file page at `/` that renders the fleet live. Three
+decisions in it are worth stating, and the first one is the one I got wrong.
+
+**"Stopped answering" and "diagnosed as unwell" are two different facts.** The
+first version of the console showed only device health, so clicking *stop
+answering* appeared to do nothing — the phone stayed `online` until the health
+monitor caught up, which on the default policy is up to thirty seconds. The
+button looked broken. It was not: the gap it exposed *is the subject of this
+project*, and collapsing the two facts into one row hid exactly the thing worth
+watching.
+
+So the console now shows both. A silenced phone is marked immediately and stays
+`online` — still assignable, because it genuinely still is — with a counter
+reading *silent for 2.4s, the system has not noticed yet*. When the system does
+react, the counter freezes at how long it took. There are two ways it finds out,
+and the difference is visible:
+
+| | how it is discovered | typical |
+|---|---|---|
+| a phone with work on it | the task fails and blames the device | ~0.4s |
+| an idle phone | the health probe misses twice | ~4s |
+
+**Operator actions share the timeline with the system's reactions.** Darkening a
+device publishes a `demo.darkened` event — not as a state change, but so the
+feed can answer "did I cause that, or did it just happen?", which is the first
+question anyone watching a fleet asks:
+
+```
+demo.darkened         demo-phone-2 — operator: driver told to stop answering
+device.quarantined    demo-phone-2 — probe failed
+device.recovery_failed demo-phone-2
+```
 
 **The socket is a change log; REST is the truth.** `EventHub` bounds every
 subscriber's queue and drops oldest-first under pressure — deliberately, so a
 stalled browser tab can never stall the fleet. A page that derived its state
-purely from that stream would therefore drift, silently, in precisely the busy
-moments when someone is watching it. So the console listens for immediacy (an
-event lands, the feed moves, a refresh is scheduled) and polls `/devices` and
-`/tasks` for correctness. When the two disagree, the poll wins.
+purely from that stream would drift, silently, in precisely the busy moments
+when someone is watching. So the console listens for immediacy and polls
+`/devices` and `/tasks` for correctness; when they disagree, the poll wins. The
+heartbeat carries that subscriber's server-side drop count and the page says so
+out loud, because a feed that silently skips events looks identical to one that
+has not missed any.
 
-The heartbeat carries that subscriber's server-side drop count, and the page
-says out loud when it is non-zero. A feed that silently skips events is worse
-than one that admits to it: a dashboard showing stale state looks exactly like a
-dashboard showing current state.
-
-The controls that darken a device are passed into the `Orchestrator` as an
-object, not enabled by a config flag. Against a real fleet nothing is handed in,
-so the routes return 404 — not 403, because "forbidden" would imply a deployment
-where a button that kills a phone might legitimately exist. Darkening does not
-mark the device unwell, publish an event or tear down its session; the driver
-simply stops answering, and everything after that is the system working it out
-on its own. That is the only version of the demo worth showing.
+The controls are passed into the `Orchestrator` as an object, not enabled by a
+config flag. Against a real fleet nothing is handed in, so the routes return 404
+— not 403, which would imply a deployment where a button that kills a phone
+might legitimately exist. Darkening marks nothing unwell and tears down no
+session; the driver simply stops answering, and everything after that is the
+system working it out on its own.
 
 The page loads nothing from the network — no CDN, no fonts, no framework —
-because a console is most needed on the bench that has no route to the internet.
-A test asserts it.
+because a console is most needed on the bench with no route to the internet. A
+test asserts it.
 
 ---
 
@@ -453,7 +479,7 @@ api/server.py           FastAPI routes -- the only module that imports FastAPI
 api/dashboard.html      the live console: one file, no build step, no CDN
 api/ws.py               EventHub, bounded fan-out, heartbeats
 obs/log.py              JSON formatter, correlation-id context
-tests/                  65 tests, mostly failure paths and layering rules
+tests/                  70 tests, mostly failure paths and layering rules
 .github/workflows/      tests + demo + rollout + booted API on 3.11-3.13, and a
                         job that installs nothing at all
 ```

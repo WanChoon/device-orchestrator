@@ -50,6 +50,20 @@ class DemoHookTests(unittest.TestCase):
         hooks.revive("p1")
         self.assertNotIn("p1", dark)
 
+    def test_silencing_is_reported_separately_from_health(self) -> None:
+        dark: set[str] = set()
+        hooks = DemoHooks(dark, phones("p1", "p2"), browsers=1)
+
+        self.assertEqual(hooks.not_answering(), [])
+        hooks.darken("p2")
+        # "This phone stopped answering" is a fact about the world. "This phone
+        # is quarantined" is a conclusion the system reaches later, on its own.
+        # Collapsing the two is what made the console look broken: the click
+        # had no visible effect until the health monitor caught up.
+        self.assertEqual(hooks.not_answering(), ["p2"])
+        hooks.revive("p2")
+        self.assertEqual(hooks.not_answering(), [])
+
     def test_reviving_something_already_alive_is_not_an_error(self) -> None:
         dark: set[str] = set()
         DemoHooks(dark, phones("p1"), browsers=1).revive("p1")
@@ -88,6 +102,17 @@ class DashboardFileTests(unittest.TestCase):
         for endpoint in ("/ws/progress", "healthz", "devices", "tasks", "demo/scenario"):
             self.assertIn(endpoint, self.html, f"console never calls {endpoint}")
 
+    def test_it_separates_being_silent_from_being_diagnosed(self) -> None:
+        # The console must render the gap between "stopped answering" and
+        # "the system noticed", because during that gap a silenced phone is
+        # still ONLINE and still assignable, and a page that shows nothing
+        # there is indistinguishable from a page whose button is broken.
+        self.assertIn("not_answering", self.html)
+        self.assertIn("has not noticed yet", self.html)
+
+    def test_it_acknowledges_a_click_before_the_round_trip(self) -> None:
+        self.assertIn("silencedAt.set", self.html)
+
     def test_it_loads_nothing_from_the_network(self) -> None:
         # An operator console that pulls a font or a framework from a CDN is
         # broken on exactly the bench that needs it most: an isolated one. This
@@ -103,20 +128,46 @@ class DashboardFileTests(unittest.TestCase):
 
 @unittest.skipUnless(HAS_FASTAPI, "fastapi is only needed by `serve`")
 class RouteTests(unittest.IsolatedAsyncioTestCase):
-    def _app(self, demo: object | None):
+    def _build(self, demo: object | None):
         from api.server import create_app
         from api.ws import EventHub
         from core.device import StaticDeviceSource
         from core.orchestrator import Orchestrator
 
-        return create_app(
-            Orchestrator(
-                source=StaticDeviceSource(phones("p1")),
-                targets={},
-                hub=EventHub(),
-                demo=demo,
-            )
+        orchestrator = Orchestrator(
+            source=StaticDeviceSource(phones("p1")),
+            targets={},
+            hub=EventHub(),
+            demo=demo,
         )
+        return orchestrator, create_app(orchestrator)
+
+    def _app(self, demo: object | None):
+        return self._build(demo)[1]
+
+    @staticmethod
+    def _route(app, path: str):
+        return next(r.endpoint for r in app.routes if getattr(r, "path", None) == path)
+
+    async def test_devices_reports_what_has_been_silenced(self) -> None:
+        hooks = DemoHooks(set(), phones("p1"), 1)
+        orchestrator, app = self._build(hooks)
+        # The inventory is loaded by `start()`; without it the registry is
+        # empty and the state assertion below would pass vacuously.
+        await orchestrator.registry.refresh()
+        handler = self._route(app, "/devices")
+
+        self.assertEqual((await handler())["not_answering"], [])
+        hooks.darken("p1")
+        payload = await handler()
+        self.assertEqual(payload["not_answering"], ["p1"])
+        # Still online: nothing about darkening touches device health, which is
+        # the property the console is built to show.
+        self.assertEqual(payload["devices"][0]["state"], "online")
+
+    async def test_a_real_deployment_reports_nothing_silenced(self) -> None:
+        handler = self._route(self._app(None), "/devices")
+        self.assertEqual((await handler())["not_answering"], [])
 
     def test_the_console_and_demo_routes_are_registered(self) -> None:
         paths = {r.path for r in self._app(DemoHooks(set(), phones("p1"), 1)).routes}
@@ -135,10 +186,7 @@ class RouteTests(unittest.IsolatedAsyncioTestCase):
     async def test_a_real_deployment_gets_no_kill_switch(self) -> None:
         from fastapi import HTTPException
 
-        app = self._app(None)
-        handler = next(
-            r.endpoint for r in app.routes if getattr(r, "path", None) == "/demo/scenario"
-        )
+        handler = self._route(self._app(None), "/demo/scenario")
 
         # Registered but inert: with no demo fleet behind them the routes 404,
         # so no wiring accident can expose a button that kills a real phone.

@@ -96,6 +96,17 @@ def build_orchestrator(
         should_fail = lambda device_id: device_id in dark  # noqa: E731
         demo_hooks = DemoHooks(dark, demo_phones or list(devices or ()), browser_count)
 
+        if health_policy is None:
+            # Detection should be quick enough to watch, but not instant --
+            # "the system takes a moment to notice" is the thing being shown,
+            # not an artefact to tune away.
+            health_policy = HealthPolicy(
+                interval_s=2.0,
+                probe_timeout_s=2.0,
+                failures_to_quarantine=2,
+                recovery_attempts=2,
+            )
+
         if probe is None:
             async def probe(device: Device) -> bool:  # noqa: F811
                 # The probe and the drivers have to agree on what "reachable"
@@ -176,6 +187,18 @@ class DemoHooks:
     def revive(self, device_id: str) -> None:
         self._dark.discard(device_id)
         log.info("demo.device_revived", device_id=device_id)
+
+    def not_answering(self) -> list[str]:
+        """Devices whose driver has been told to go silent.
+
+        This is deliberately not the same question as "which devices are
+        unhealthy". A phone that has just stopped answering is still ONLINE and
+        still assignable, for as long as it takes the health monitor to find
+        out -- and that gap is the entire subject of this project, so the
+        console shows both facts instead of collapsing them into one.
+        """
+
+        return sorted(self._dark)
 
     def scenario(self) -> list[TaskSpec]:
         """Enough work to keep every device busy for a while, plus one task that

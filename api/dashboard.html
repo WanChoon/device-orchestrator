@@ -248,6 +248,27 @@
   .tag.quarantined { color: var(--bad); background: var(--bad-wash); border-color: var(--bad); }
   .tag.retired     { color: var(--gone); background: var(--gone-wash); border-color: var(--gone); }
   .tag.leased      { color: var(--ink-mute); background: var(--sunk); border-color: var(--rule); }
+  .tag.silent      { color: var(--bad); background: var(--bad-wash); border-color: var(--bad); }
+
+  /* A device you have silenced, before the system has worked it out. The
+     dashed edge is the point: this is a fact about the world, not a state the
+     orchestrator has reached. */
+  .device.silenced { background: var(--bad-wash); }
+  .device.silenced .id::after {
+    content: " · you silenced this";
+    font-weight: 400;
+    font-size: 11px;
+    color: var(--bad);
+  }
+  .tag.silent { border-style: dashed; }
+
+  .lag {
+    grid-column: 1 / -1;
+    font-family: var(--mono);
+    font-size: 11.5px;
+    color: var(--bad);
+    margin-top: 3px;
+  }
 
   /* ---------------------------------------------------------- tasks */
 
@@ -299,6 +320,15 @@
   .ev .d { color: var(--ink-mid); overflow-wrap: anywhere; }
   .ev.device\.quarantined .k, .ev.device\.retired .k, .ev.device\.recovery_failed .k { color: var(--bad); }
   .ev.device\.restored .k { color: var(--online); }
+  /* Operator actions are visually separated from the system's reactions, so
+     the feed reads as cause and effect rather than as one undifferentiated
+     stream of things that happened. */
+  .ev.demo\.darkened, .ev.demo\.revived {
+    background: var(--sunk);
+    border-left: 3px solid var(--ink-mute);
+  }
+  .ev.demo\.darkened .k { color: var(--bad); }
+  .ev.demo\.revived .k { color: var(--online); }
 
   .empty { padding: 26px 16px; color: var(--ink-mute); font-size: 13px; }
 </style>
@@ -366,6 +396,15 @@
   let demoControls = false;
   let refreshQueued = false;
 
+  let inventory = [];
+  // Which devices have been silenced, per the server. Kept separate from the
+  // orchestrator's own health state on purpose: "this phone stopped answering"
+  // and "the system has worked that out" are two different facts, and the delay
+  // between them is the thing this console exists to make visible.
+  let silenced = new Set();
+  const silencedAt = new Map();   // device -> when it went quiet (client clock)
+  const noticedAfter = new Map(); // device -> seconds the system took to react
+
   // ------------------------------------------------------------- rendering
 
   const escape = (value) =>
@@ -387,12 +426,27 @@
     }
     host.innerHTML = devices.map((d) => {
       const state = escape(d.state);
-      const dark = d.state !== "online";
-      const control = demoControls && d.transport !== "virtual"
-        ? `<button type="button" class="${dark ? "" : "danger"}" data-act="${dark ? "revive" : "darken"}" data-id="${escape(d.id)}">${dark ? "revive" : "stop answering"}</button>`
+      const quiet = silenced.has(d.id);
+      const physical = d.transport !== "virtual";
+
+      const control = demoControls && physical
+        ? `<button type="button" class="${quiet ? "" : "danger"}" data-act="${quiet ? "revive" : "darken"}" data-id="${escape(d.id)}">${quiet ? "revive" : "stop answering"}</button>`
         : "";
+
+      // The whole point of the demo lives in this line: a silenced phone stays
+      // ONLINE and assignable until the health monitor catches up, and the
+      // console says how long that has been rather than looking frozen.
+      let lag = "";
+      if (quiet && d.state === "online") {
+        const since = silencedAt.get(d.id);
+        const secs = since ? ((Date.now() - since) / 1000).toFixed(1) : "?";
+        lag = `<div class="lag">silent for ${secs}s — the system has not noticed yet</div>`;
+      } else if (noticedAfter.has(d.id)) {
+        lag = `<div class="lag">the system noticed after ${noticedAfter.get(d.id)}s</div>`;
+      }
+
       return `
-        <div class="device">
+        <div class="device${quiet ? " silenced" : ""}">
           <div class="id">${escape(d.id)}</div>
           <div class="meta">
             ${escape(d.transport)} · ${escape(d.model || "—")}
@@ -400,10 +454,12 @@
           </div>
           <div class="acts">
             <span class="tag ${state}">${state}</span>
+            ${quiet ? '<span class="tag silent">not answering</span>' : ""}
             ${d.leased ? '<span class="tag leased">leased</span>' : ""}
             ${control}
           </div>
           ${d.note ? `<div class="note">${escape(d.note)}</div>` : ""}
+          ${lag}
         </div>`;
     }).join("");
   }
@@ -478,7 +534,24 @@
       $("run").disabled = !demoControls;
       $("run").title = demoControls ? "" : "this deployment has no demo fleet";
 
-      const inventory = devices.devices || [];
+      inventory = devices.devices || [];
+      silenced = new Set(devices.not_answering || []);
+
+      for (const device of inventory) {
+        if (!silenced.has(device.id)) {
+          silencedAt.delete(device.id);
+          noticedAfter.delete(device.id);
+        } else if (silencedAt.has(device.id) && device.state !== "online"
+                   && !noticedAfter.has(device.id)) {
+          // The moment the system reacts, freeze how long it took. Watching
+          // that number is the difference between "I broke it" and "it broke".
+          noticedAfter.set(
+            device.id,
+            ((Date.now() - silencedAt.get(device.id)) / 1000).toFixed(1)
+          );
+        }
+      }
+
       $("s-online").textContent = inventory.filter((d) => d.state === "online").length;
       $("s-bad").textContent = inventory.filter((d) => d.state !== "online").length;
 
@@ -552,11 +625,35 @@
 
   $("run").addEventListener("click", () => post("demo/scenario"));
 
-  $("devices").addEventListener("click", (e) => {
+  $("devices").addEventListener("click", async (e) => {
     const button = e.target.closest("button[data-act]");
     if (!button) return;
-    post(`demo/devices/${encodeURIComponent(button.dataset.id)}/${button.dataset.act}`);
+
+    const id = button.dataset.id;
+    const act = button.dataset.act;
+
+    // Acknowledge before the round trip. The server-side effect is invisible
+    // for seconds by design -- the health monitor has to find out on its own --
+    // and a button that looks like it did nothing for that long reads as
+    // broken, which is the one thing this demo must not do.
+    button.disabled = true;
+    if (act === "darken") {
+      silenced.add(id);
+      silencedAt.set(id, Date.now());
+      noticedAfter.delete(id);
+    } else {
+      silenced.delete(id);
+      silencedAt.delete(id);
+      noticedAfter.delete(id);
+    }
+    renderDevices(inventory);
+
+    await post(`demo/devices/${encodeURIComponent(id)}/${act}`);
   });
+
+  // Re-render often enough for the "silent for Ns" counter to tick. The
+  // inventory is a handful of rows, so this costs nothing.
+  setInterval(() => { if (silencedAt.size) renderDevices(inventory); }, 250);
 
   // The socket gives immediacy; the poll gives correctness. Both run.
   connect();

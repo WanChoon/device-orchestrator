@@ -64,6 +64,13 @@ def create_app(orchestrator: Orchestrator) -> FastAPI:
             "devices": orchestrator.registry.snapshot(),
             "health": orchestrator.health.snapshot(),
             "sessions": orchestrator.sessions.describe(),
+            # Which devices have been silenced, as distinct from which ones the
+            # system has worked out are unwell. A device appears here the
+            # instant it is darkened and stays ONLINE until the monitor
+            # notices, which is the gap worth being able to see.
+            "not_answering": (
+                orchestrator.demo.not_answering() if orchestrator.demo else []
+            ),
         }
 
     @app.post("/devices/refresh")
@@ -107,15 +114,35 @@ def create_app(orchestrator: Orchestrator) -> FastAPI:
     @app.post("/demo/devices/{device_id}/darken")
     async def demo_darken(device_id: str) -> dict[str, Any]:
         _demo().darken(device_id)
-        # Nothing else happens here on purpose. The device is not marked unwell,
-        # no event is published, no session is torn down -- it simply stops
-        # answering, which is exactly what a phone that has come off its cable
-        # does. Everything after this is the system noticing on its own.
+        # Nothing happens to the device's health here, on purpose: it is not
+        # marked unwell and its session is not torn down. It simply stops
+        # answering, exactly as a phone that has come off its cable does, and
+        # everything after this is the system noticing on its own.
+        #
+        # The event is published anyway -- not as a state change, but so the
+        # operator's action and the system's reaction sit on one timeline. A
+        # feed that shows only `device.quarantined` cannot answer "did I cause
+        # that, or did it just happen?", which is the first question anyone
+        # watching a fleet asks.
+        await orchestrator.hub.publish(
+            {
+                "type": "demo.darkened",
+                "device_id": device_id,
+                "reason": "operator: driver told to stop answering",
+            }
+        )
         return {"device_id": device_id, "answering": False}
 
     @app.post("/demo/devices/{device_id}/revive")
     async def demo_revive(device_id: str) -> dict[str, Any]:
         _demo().revive(device_id)
+        await orchestrator.hub.publish(
+            {
+                "type": "demo.revived",
+                "device_id": device_id,
+                "reason": "operator: driver answering again",
+            }
+        )
         return {"device_id": device_id, "answering": True}
 
     @app.websocket("/ws/progress")
