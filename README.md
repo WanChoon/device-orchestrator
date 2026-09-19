@@ -1,13 +1,16 @@
 # device-orchestrator
 
+[![ci](https://github.com/WanChoon/device-orchestrator/actions/workflows/ci.yml/badge.svg)](https://github.com/WanChoon/device-orchestrator/actions/workflows/ci.yml)
+
 An asyncio orchestrator that runs the same automation task against an Android
-device or a browser, keeps a fleet of devices working unattended, and reports
-progress over WebSocket.
+device or a browser, deploys builds across a phone fleet, keeps that fleet
+working unattended, and reports progress over WebSocket.
 
 ```bash
 pip install -r requirements.txt
 python cli.py demo                    # full run, no adb / Appium / browser needed
-python -m unittest discover -s tests  # 16 tests, ~3s
+python cli.py deploy --fake           # APK rollout across a fleet, no phone needed
+python -m unittest discover -s tests  # 51 tests, ~5s
 python cli.py serve --fake            # HTTP + WebSocket on :8080
 ```
 
@@ -28,8 +31,11 @@ flowchart LR
     reg --> contract{{"Target contract<br/>core/task.py"}}
     contract --> android["AndroidTarget"]
     contract --> web["WebTarget"]
+    contract --> apk["ApkTarget<br/>no session"]
     android -->|Appium W3C| phone(["Android device<br/>usb / tcp / tunnel"])
     web -->|Playwright| slot(["Browser slot<br/>transport=virtual"])
+    apk -->|install / verify| phone
+    creds[("CredentialStore<br/>TokenCache / CookieJar")] -.->|by reference| web
     sched -.->|retry, jittered| queue
     sched --> hub[["EventHub"]] --> ws(["WS /ws/progress"])
     health["HealthMonitor<br/>quarantine / retire"] -->|adb shell true, 2s| adb["adb<br/>bounded subprocess"]
@@ -55,6 +61,7 @@ made in two places.**
 | `core/session.py` | When a remote session is stale and how hard to try reopening it |
 | `core/health.py` | When a device is sick, how to fix it, and when to stop trying |
 | `core/scheduler.py` | Which work runs next, on what, and whether to retry |
+| `core/auth.py` | Where secrets live, when a token is stale, who may log in |
 | `targets/*.py` | How to turn steps into commands for one backend |
 | `api/*.py` | How the outside world submits work and watches it |
 | `obs/log.py` | What a log line looks like |
@@ -68,9 +75,11 @@ Three of those boundaries were the ones worth arguing about.
 automation backend.
 
 The scheduler never imports `targets/`. It holds a `dict[str, Target]` handed to
-it at construction. `AndroidTarget` and `WebTarget` are peers — there is no
-`if kind == "android"` anywhere in `core/`, and adding an iOS or desktop target
-requires no change to the scheduler at all.
+it at construction. `AndroidTarget`, `WebTarget` and `ApkTarget` are peers —
+there is no `if kind == "android"` anywhere in `core/`, and adding an iOS or
+desktop target requires no change to the scheduler at all. `ApkTarget` arrived
+after the other two and needed no change to `core/`, which is the only evidence
+for that claim worth anything.
 
 The narrowness is the point. A wider contract — letting targets report their own
 retry counts, request specific devices mid-run, or reach into the registry —
@@ -176,6 +185,111 @@ which is what it is for.
 
 ---
 
+## Deploying a build to the whole fleet
+
+```bash
+python cli.py deploy --apk build/app.apk --package com.example.app \
+                     --expect-version 1.4.2 --launch
+```
+
+`ApkTarget` is a `Target` like the other two, so a rollout gets leases,
+deadlines, retries, blame and the progress feed without the scheduler learning
+what a package is. It is also the target that proves the contract was narrow
+enough: **it holds no `SessionManager`.** Sessions were an Appium and Playwright
+detail, not a contract detail, and a target that needs none is the only way to
+find that out.
+
+Three things shape the module, and none of them are about installing.
+
+**A rollout is the one workload where late binding is wrong.** Everywhere else a
+task wants *a* device and the queue picks; a rollout wants *every* device. So
+`deploy` submits one task per device pinned with `selector.device_id` — the same
+selector any task can use. There is no separate rollout mechanism, because a
+second one would mean maintaining retry, health and reporting twice. A partial
+rollout is then reported as a failure with a list, not a success with a warning:
+a fleet running two builds makes every later result depend on which phone the
+task happened to land on.
+
+**The exit code is not the verdict.** `adb install`, and `adb shell pm install`
+much more so, have across versions printed `Failure [INSTALL_FAILED_…]` on
+stdout while exiting `0`. Trusting `returncode` gives you a green deploy of a
+build that is not on the phone — worse than a red one, because nobody goes
+looking. The output is parsed, and silence is treated as failure rather than
+optimistically passed.
+
+**Install failures split three ways, and the middle one is the interesting one.**
+
+| Failure | Classified as | Why |
+|---|---|---|
+| `UPDATE_INCOMPATIBLE`, `VERSION_DOWNGRADE`, parse failures | `FatalError` | Fails identically on every phone. Retrying burns the bench to reproduce one message N times. |
+| `NO_MATCHING_ABIS`, `OLDER_SDK` | `RetryableError(blames_device=False)` | A *healthy* phone that is the wrong phone. Send the task elsewhere; hold nothing against it. The real fix is a selector — retry is the fallback for when bench tags have drifted. |
+| `INSUFFICIENT_STORAGE`, `MEDIA_UNAVAILABLE`, offline, timeout | `RetryableError(blames_device=True)` | It will still be out of space for the next task. Quarantine it. |
+
+That middle row is why the error taxonomy carries blame instead of a boolean.
+Without it, an ABI mismatch on a mixed-architecture bench quarantines every
+phone it touches, and the fleet retires itself over a build that was never
+meant for those devices.
+
+Finally, `verify` is a separate step, because *installed* and *having installed*
+are different claims. A `Success` means the package manager committed a session;
+it does not mean the version you wanted is what a user would launch — not when a
+deploy races an OEM updater or a work profile. `verify` reads `versionName` back
+out of `dumpsys`, and an install that reported success against a package
+`dumpsys` has never heard of blames the device, because no other phone will
+reproduce it. Each install also records the SHA-256 of the bytes that shipped: a
+deploy log naming a path records an intention, one naming a digest records an
+event, and paths get overwritten by the next CI run.
+
+---
+
+## Credentials, tokens and sessions
+
+Auth arrives in an orchestrator as three unrelated problems, and conflating them
+is how automation gets locked out of the system it is automating.
+
+**A TaskSpec is not a place to put a password.** Specs are serialised to JSON,
+accepted over HTTP, echoed back from `/tasks/{id}` and written to the log on
+every state change. A password in `spec.params` is therefore a password in the
+log, and scrubbing downstream does not fix it — the fix is that it was never
+there. Specs carry a reference (`{"op": "auth", "credential": "demo-bank"}`) and
+`CredentialStore` resolves it inside the target at the moment of use. Secrets are
+wrapped in a `Secret` that refuses to print itself, so a leak has to be an
+explicit `.reveal()` that shows up in review rather than an f-string in a stack
+trace.
+
+**A token's expiry is knowable, so waiting for a 401 is a choice.** A JWT carries
+`exp` in cleartext. Refreshing at `exp - skew` costs one request; discovering
+expiry by failing a task costs the task, its retry, and a device-blaming signal
+that was never the device's fault. `core/auth.py` reads the claim and does *not*
+verify the signature — the client is not the verifier, and checking a signature
+against a key we also hold would be theatre. The unverified claim is used as a
+scheduling hint, never as an authorisation decision.
+
+**Re-authenticating is the expensive operation.** Twenty workers whose token
+expired in the same second will, without coordination, fire twenty logins at
+once — which is indistinguishable from credential stuffing and is how a fleet
+gets rate-limited or an account gets locked. `TokenCache` refresh is
+single-flight per realm, and `CookieJar` keeps a logged-in session that later
+tasks reuse, so N tasks do not mean N logins. The jar also reports a session of
+entirely expired cookies as *not live*, because a dead jar is worse than an
+empty one: the next task looks logged in until its first protected request, and
+the failure surfaces somewhere unrelated to its cause.
+
+Because bad credentials fail identically everywhere, an auth failure is
+`FatalError`, not a retry. Retrying a wrong password across a fleet is just a
+faster way to get the account locked.
+
+Encryption at rest uses AES-GCM when `cryptography` is installed. It is not a
+required dependency, so there is a stdlib fallback — scrypt for derivation, an
+HMAC-SHA256 counter-mode keystream, encrypt-then-MAC, constant-time tag
+comparison, a fresh random nonce per seal. That construction is sound and it is
+still hand-rolled, which is a thing to do deliberately, once, and say out loud:
+it exists so this repo can be evaluated without installing anything. The honest
+production answer is AES-GCM via `cryptography`, or better, never holding the
+key and asking a KMS. `SecretBox` is the single seam either answer plugs into.
+
+---
+
 ## Logging
 
 Every line is one JSON object. There is no human-readable mode.
@@ -250,9 +364,19 @@ workload I have not measured.
 mostly plumbing — upload, retention, a URL in the result dict. It would have
 added the most lines and demonstrated the least about orchestration.
 
-**No auth on the API.** It binds to `127.0.0.1` by default and is meant to sit
-behind something that does authentication properly. A hand-rolled token check
-here would be worse than none, because it would look like security.
+**No auth on the orchestrator's own API** — which is a different question from
+the credential handling above, and worth separating because the two get
+confused. `core/auth.py` is about proving *the fleet's* identity to the systems
+it automates. The `/tasks` API has no authentication of its own: it binds to
+`127.0.0.1` and is meant to sit behind something that does it properly. A
+hand-rolled token check on the ingress would be worse than none, because it
+would look like security.
+
+**No custom ROM work, and no flashing.** The JD-adjacent version of this project
+would image devices as well as deploy to them, and it does not: `fastboot`,
+unlock state, A/B slots and recovery are a different discipline from
+orchestration, and a bench that can brick itself deserves more care than a
+portfolio repo can honestly show. Deployment here stops at `pm install`.
 
 **Playwright is optional.** Without it, `targets/web.py` falls back to an
 in-process fake driver and the orchestration still runs end to end. A project
@@ -271,18 +395,21 @@ reading the code.
 ## Layout
 
 ```
-cli.py                  devices / run / serve / demo
+cli.py                  devices / run / deploy / serve / demo
 core/task.py            TaskSpec, Target, the error taxonomy, TaskContext
 core/device.py          Adb subprocess wrapper, Device, DeviceRegistry, Lease
 core/session.py         SessionManager: reconnect, backoff, generations
 core/health.py          probe -> quarantine -> recover -> retire
 core/scheduler.py       asyncio worker pool, leases, deadlines, retry
+core/auth.py            Secret, SecretBox, JWT expiry, TokenCache, CookieJar
 targets/android.py      Appium W3C client + AndroidTarget + fakes
-targets/web.py          Playwright + WebTarget + fakes + browser slots
+targets/web.py          Playwright + WebTarget + auth ops + fakes + slots
+targets/apk.py          install / verify / launch, the blame taxonomy, FakeAdb
 api/server.py           FastAPI routes, Orchestrator wiring
 api/ws.py               EventHub, bounded fan-out, heartbeats
 obs/log.py              JSON formatter, correlation-id context
-tests/                  16 tests, mostly failure paths
+tests/                  51 tests, mostly failure paths
+.github/workflows/      unit tests + demo + rollout + a booted API, on 3.11-3.13
 ```
 
 ## API
