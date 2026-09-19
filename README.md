@@ -9,7 +9,7 @@ working unattended, and reports progress over WebSocket.
 ```bash
 python cli.py demo                    # full run: no install, no adb, no Appium, no browser
 python cli.py deploy --fake           # APK rollout across a fleet, no phone needed
-python -m unittest discover -s tests  # 72 tests, ~5s
+python -m unittest discover -s tests  # 75 tests, ~5s
 
 pip install -r requirements.txt       # only `serve` needs anything
 python cli.py serve --fake            # live console on http://127.0.0.1:8080/
@@ -193,6 +193,32 @@ device goes to `RETIRED` and stays there until a human intervenes.
 Retirement costs one device and protects the queue. It is also the only state
 that should page someone — everything else is the system absorbing a fault,
 which is what it is for.
+
+### A recovery is work whose premise can expire while it runs
+
+Recovery runs in the background, and two things about that only showed up once
+the console made the event stream visible.
+
+**A finished episode can be reporting on a world that no longer exists.** A
+device can be brought back by something else while its recovery is still in
+flight — the sweep probe succeeded, or an operator fixed the cable. The first
+version published `device.recovery_failed` anyway, seconds *after*
+`device.restored`, for a device that was healthy and online at that moment. That
+is worse than silence: it is a lie shaped like telemetry. Every attempt now
+checks that the device is still `QUARANTINED`, and an episode whose premise has
+expired abandons quietly.
+
+**A device that is simply gone fails forever.** Unplugged, powered off, taken
+home for the weekend — every episode fails, and the monitor opened a new one on
+every sweep. That costs no CPU worth mentioning and all of the signal: one dead
+phone emitted an identical event every few seconds, and because the event feed
+is deliberately bounded, it pushed out everything anyone actually needed. Failed
+episodes now back off exponentially (8s, 16s, 32s… capped), each event carries
+which episode it was and when the next one is due, and coming back clears the
+backoff so the next outage is chased immediately. Detection of a return does not
+depend on this at all — the sweep probe still runs every interval, so a device
+that comes back is noticed within one sweep no matter how far the recovery
+backoff has grown.
 
 ---
 
@@ -489,7 +515,7 @@ api/server.py           FastAPI routes -- the only module that imports FastAPI
 api/dashboard.html      the live console: one file, no build step, no CDN
 api/ws.py               EventHub, bounded fan-out, heartbeats
 obs/log.py              JSON formatter, correlation-id context
-tests/                  72 tests, mostly failure paths and layering rules
+tests/                  75 tests, mostly failure paths and layering rules
 .github/workflows/      tests + demo + rollout + booted API on 3.11-3.13, and a
                         job that installs nothing at all
 ```

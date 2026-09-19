@@ -48,6 +48,13 @@ class HealthPolicy:
     recovery_attempts: int = 2        # tries per quarantine episode
     retire_after_recoveries: int = 5  # lifetime recoveries before giving up
     recovery_window_s: float = 900.0  # recoveries older than this stop counting
+    # A device that is simply gone -- unplugged, powered off, taken home for the
+    # weekend -- fails every recovery episode forever. Without a backoff the
+    # monitor opens a new episode on every sweep, which costs nothing in CPU and
+    # everything in signal: one dead phone drowns the event feed, and the feed
+    # is bounded, so it pushes out the events someone actually needed.
+    recovery_backoff_base_s: float = 8.0
+    recovery_backoff_cap_s: float = 300.0
 
 
 @dataclass
@@ -57,6 +64,8 @@ class DeviceHealth:
     last_ok_at: Optional[float] = None
     last_probe_ms: Optional[float] = None
     recovery_times: list[float] = field(default_factory=list)
+    failed_recoveries: int = 0        # consecutive episodes that got nowhere
+    next_recovery_at: float = 0.0     # monotonic; no new episode before this
 
     def recent_recoveries(self, window_s: float) -> int:
         cutoff = time.monotonic() - window_s
@@ -70,6 +79,7 @@ class DeviceHealth:
             "last_ok_at": self.last_ok_at,
             "last_probe_ms": self.last_probe_ms,
             "recoveries_in_window": len(self.recovery_times),
+            "failed_recoveries": self.failed_recoveries,
         }
 
 
@@ -254,6 +264,11 @@ class HealthMonitor:
         existing = self._recoveries.get(device.id)
         if existing is not None and not existing.done():
             return  # one recovery per device at a time
+        if time.monotonic() < health.next_recovery_at:
+            # Still inside the backoff from the last failed episode. The device
+            # stays QUARANTINED and unassignable either way; retrying sooner
+            # buys nothing and costs the feed.
+            return
         task = asyncio.create_task(
             self._attempt_recovery(device, health), name=f"recover-{device.id}"
         )
@@ -276,6 +291,16 @@ class HealthMonitor:
         correlation_id = new_correlation_id("heal")
         with log_context(correlation_id=correlation_id, device_id=device.id):
             for attempt in range(1, self._policy.recovery_attempts + 1):
+                if device.state is not DeviceState.QUARANTINED:
+                    # Something else already brought it back: the sweep probe
+                    # succeeded, or an operator fixed the cable. This episode is
+                    # now reasoning about a world that no longer exists, and its
+                    # verdict must not be published -- a `recovery_failed` for a
+                    # device that is currently ONLINE is worse than no event,
+                    # because it is a lie that looks like telemetry.
+                    log.info("health.recovery_abandoned", device_id=device.id,
+                             state=device.state.value)
+                    return
                 log.info(
                     "health.recovery_attempt",
                     attempt=attempt,
@@ -292,14 +317,48 @@ class HealthMonitor:
                     health.consecutive_failures = 0
                     await self._restore(device, health, reason="adb reconnect")
                     return
-                await asyncio.sleep(min(2.0 * attempt, 10.0))
+                if attempt < self._policy.recovery_attempts:
+                    # No sleep after the final attempt: the verdict is already
+                    # decided, and waiting only delays telling anyone.
+                    await asyncio.sleep(min(2.0 * attempt, 10.0))
 
-            log.warning("health.recovery_exhausted", device_id=device.id)
+            if device.state is not DeviceState.QUARANTINED:
+                log.info("health.recovery_abandoned", device_id=device.id,
+                         state=device.state.value)
+                return
+
+            health.failed_recoveries += 1
+            delay = min(
+                self._policy.recovery_backoff_base_s * (2 ** (health.failed_recoveries - 1)),
+                self._policy.recovery_backoff_cap_s,
+            )
+            health.next_recovery_at = time.monotonic() + delay
+            log.warning(
+                "health.recovery_exhausted",
+                device_id=device.id,
+                episode=health.failed_recoveries,
+                next_try_in_s=round(delay),
+            )
             await self._emit(
-                {"type": "device.recovery_failed", "device_id": device.id}
+                {
+                    "type": "device.recovery_failed",
+                    "device_id": device.id,
+                    "episode": health.failed_recoveries,
+                    "next_try_in_s": round(delay),
+                    # Carried as prose too, so a repeated line in the feed says
+                    # something different each time instead of reading as spam.
+                    "reason": (
+                        f"recovery {health.failed_recoveries} failed, "
+                        f"next try in {round(delay)}s"
+                    ),
+                }
             )
 
     async def _restore(self, device: Device, health: DeviceHealth, reason: str) -> None:
+        # A device that is back gets a clean slate: the next outage should be
+        # chased immediately, not throttled by the backoff the last one earned.
+        health.failed_recoveries = 0
+        health.next_recovery_at = 0.0
         await self._registry.set_state(device.id, DeviceState.ONLINE, note=reason)
         await self._emit(
             {"type": "device.restored", "device_id": device.id, "reason": reason}

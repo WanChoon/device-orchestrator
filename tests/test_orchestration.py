@@ -305,6 +305,114 @@ class TargetContractTests(unittest.IsolatedAsyncioTestCase):
             await orchestrator.stop()
 
 
+class RecoveryTests(unittest.IsolatedAsyncioTestCase):
+    """A background recovery is work whose premise can expire while it runs."""
+
+    async def _monitor(self, probe_ok):
+        from core.device import Adb, DeviceRegistry, StaticDeviceSource
+        from core.health import HealthMonitor, HealthPolicy
+
+        registry = DeviceRegistry(StaticDeviceSource(phones("phone-1")))
+        await registry.refresh()
+
+        class DeadAdb(Adb):
+            def available(self) -> bool:
+                return True
+
+            async def reconnect(self, serial, timeout=10.0) -> bool:
+                return False
+
+        events = []
+
+        async def sink(event):
+            events.append(event)
+
+        monitor = HealthMonitor(
+            registry,
+            DeadAdb(),
+            SessionManager(),
+            policy=HealthPolicy(
+                interval_s=60.0,              # no sweeps; drive it by hand
+                recovery_attempts=1,
+                recovery_backoff_base_s=4.0,
+                recovery_backoff_cap_s=32.0,
+            ),
+            sink=sink,
+            probe=probe_ok,
+        )
+        return registry, monitor, events
+
+    async def test_a_recovery_that_finishes_after_a_restore_says_nothing(self) -> None:
+        async def never(device):
+            return False
+
+        registry, monitor, events = await self._monitor(never)
+        device = registry.all()[0]
+        await monitor.quarantine("phone-1", reason="test")
+        events.clear()
+
+        # Something else brings it back while the episode is still running --
+        # the sweep probe succeeded, or an operator fixed the cable.
+        await registry.set_state("phone-1", DeviceState.ONLINE, note="probe recovered")
+        await monitor._attempt_recovery(device, monitor.health_for("phone-1"))
+
+        # Its verdict is about a world that no longer exists. Publishing
+        # `recovery_failed` for a device that is currently ONLINE is a lie that
+        # looks like telemetry.
+        kinds = [e["type"] for e in events]
+        self.assertNotIn("device.recovery_failed", kinds, kinds)
+
+    async def test_repeated_failures_back_off_instead_of_flooding(self) -> None:
+        async def never(device):
+            return False
+
+        registry, monitor, events = await self._monitor(never)
+        device = registry.all()[0]
+        health = monitor.health_for("phone-1")
+        await monitor.quarantine("phone-1", reason="test")
+
+        delays = []
+        for _ in range(4):
+            health.next_recovery_at = 0.0          # pretend the wait elapsed
+            await monitor._attempt_recovery(device, health)
+            failed = [e for e in events if e["type"] == "device.recovery_failed"]
+            delays.append(failed[-1]["next_try_in_s"])
+
+        # A phone that is simply gone fails every episode forever. Without
+        # growth, one dead device emits an event every few seconds and pushes
+        # everything anyone needed out of a bounded feed.
+        self.assertEqual(delays, sorted(delays))
+        self.assertGreater(delays[-1], delays[0])
+        self.assertLessEqual(delays[-1], 32.0)
+
+        # Each line has to say something different, or it reads as spam.
+        # (quarantine() spawns an episode of its own, so count what arrived
+        # rather than assuming only the hand-driven ones are here.)
+        failed_events = [e for e in events if e["type"] == "device.recovery_failed"]
+        reasons = {e["reason"] for e in failed_events}
+        self.assertEqual(len(reasons), len(failed_events))
+
+    async def test_coming_back_clears_the_backoff(self) -> None:
+        async def never(device):
+            return False
+
+        registry, monitor, events = await self._monitor(never)
+        device = registry.all()[0]
+        health = monitor.health_for("phone-1")
+
+        await monitor.quarantine("phone-1", reason="test")
+        health.next_recovery_at = 0.0
+        await monitor._attempt_recovery(device, health)
+        self.assertGreater(health.failed_recoveries, 0)
+
+        await monitor._restore(device, health, reason="probe recovered")
+
+        # The next outage is a fresh problem and deserves to be chased
+        # immediately, not throttled by what the last one earned.
+        self.assertEqual(health.failed_recoveries, 0)
+        self.assertEqual(health.next_recovery_at, 0.0)
+
+
 class SpecTests(unittest.TestCase):
     def test_missing_kind_is_fatal(self) -> None:
         with self.assertRaises(FatalError):

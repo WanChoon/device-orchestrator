@@ -201,6 +201,8 @@
     gap: 10px;
   }
   .panel > h2 em { font-style: normal; font-weight: 400; letter-spacing: 0; text-transform: none; }
+  .head-tools { display: inline-flex; align-items: center; gap: 10px; }
+  .head-tools button { padding: 3px 10px; font-size: 11px; }
 
   /* ---------------------------------------------------------- devices */
 
@@ -377,7 +379,13 @@
   </div>
 
   <section class="panel">
-    <h2>Event stream <em>live from /ws/progress · newest first</em></h2>
+    <h2>
+      <span>Event stream</span>
+      <span class="head-tools">
+        <em id="feed-count"></em>
+        <button id="clear" type="button">clear</button>
+      </span>
+    </h2>
     <div id="feed" class="feed">
       <p class="empty">no events yet</p>
     </div>
@@ -398,6 +406,8 @@
   let refreshQueued = false;
 
   let inventory = [];
+  let seenEvents = 0;
+  let clearedAt = new Date().toTimeString().slice(0, 8);
   // Which devices have been silenced, per the server. Kept separate from the
   // orchestrator's own health state on purpose: "this phone stopped answering"
   // and "the system has worked that out" are two different facts, and the delay
@@ -562,6 +572,7 @@
     if (feed.firstElementChild && feed.firstElementChild.className === "empty") {
       feed.innerHTML = "";
     }
+    seenEvents += 1;
     const now = new Date();
     const clock = now.toTimeString().slice(0, 8) +
       "." + String(now.getMilliseconds()).padStart(3, "0");
@@ -585,6 +596,7 @@
       `<span class="d">${escape(detail)}</span>`;
     feed.prepend(row);
     while (feed.childElementCount > MAX_FEED) feed.lastElementChild.remove();
+    $("feed-count").textContent = `${seenEvents} since ${clearedAt}`;
   }
 
   // ------------------------------------------------------------- transport
@@ -691,6 +703,16 @@
   }
 
   $("run").addEventListener("click", () => post("demo/scenario"));
+
+  $("clear").addEventListener("click", () => {
+    // Clears the view, not the server's ring buffer -- a reconnect replays the
+    // last hundred events by design, so a late-joining tab is never blank. If
+    // the feed refills on its own, the socket dropped and came back.
+    $("feed").innerHTML = '<p class="empty">cleared — waiting for the next event</p>';
+    seenEvents = 0;
+    clearedAt = new Date().toTimeString().slice(0, 8);
+    $("feed-count").textContent = `0 since ${clearedAt}`;
+  });
 
   $("devices").addEventListener("click", async (e) => {
     const button = e.target.closest("button[data-act]");
