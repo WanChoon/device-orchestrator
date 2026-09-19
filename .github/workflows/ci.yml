@@ -1,0 +1,104 @@
+# The unit tests prove the pieces; the CLI runs prove they are still wired
+# together. Every orchestration bug this project has had was found by running
+# `demo` or `serve`, not by reading the code, so the scripted runs are CI checks
+# rather than something to remember to try by hand after a refactor.
+#
+# Nothing here needs a phone, a browser or an Appium server. The fakes implement
+# the same surface as the real drivers, which is what makes an end-to-end run
+# something CI can have at all.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.11 is the floor (`asyncio.to_thread`, PEP 604 unions, `X | None` in
+        # annotations); 3.13 is here to catch deprecations early rather than on
+        # the morning the runner image moves.
+        python-version: ["3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Unit tests
+        run: python -m unittest discover -s tests -v
+
+      - name: End-to-end run with a device that dies mid-flight
+        # The exit status is the assertion: the scheduler has to finish the
+        # queue on the surviving devices after demo-phone-3 stops answering.
+        run: python cli.py --log-level WARNING demo --wait 60
+
+      - name: APK rollout across a fleet
+        run: >
+          python cli.py --log-level WARNING deploy --fake
+          --package com.example.demo --expect-version 1.4.2
+
+      - name: API boots and answers
+        # `serve` is the one path the unit tests cannot cover: the bug it caught
+        # -- browser slots being adb-probed into quarantine -- only appeared
+        # after the health monitor had been running for thirty seconds.
+        run: |
+          python cli.py --log-level WARNING serve --fake --port 8099 &
+          server=$!
+          trap 'kill "$server" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 30); do
+            curl -fsS "http://127.0.0.1:8099/healthz" >/dev/null 2>&1 && break
+            sleep 1
+          done
+          curl -fsS "http://127.0.0.1:8099/healthz" | tee /dev/stderr | grep -q '"ready": *true'
+          curl -fsS "http://127.0.0.1:8099/devices" >/dev/null
+
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Byte-compile everything
+        run: python -m compileall -q core targets api obs cli.py tests
+
+      - name: Every documented subcommand exists
+        # The README is the main artefact of this repo, so a command that the
+        # README describes and the CLI has quietly lost is a real defect here.
+        run: |
+          for cmd in devices run deploy serve demo; do
+            python cli.py "$cmd" --help > /dev/null
+          done
+
+      - name: No credential material in tracked files
+        # The whole point of `core/auth.py` is that secrets are referenced, not
+        # embedded. This fails the build if that stops being true.
+        run: |
+          if git grep -nIE '(password|passwd|secret|api[_-]?key|token)[[:space:]]*=[[:space:]]*["'"'"'][^"'"'"']{8,}' \
+               -- ':!tests/*' ':!*.md' ':!.github/*'; then
+            echo "::error::credential-shaped literal in tracked source"
+            exit 1
+          fi
