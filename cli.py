@@ -5,7 +5,7 @@
     python cli.py devices               what adb currently sees
     python cli.py run --file task.json  submit one task and wait for it
     python cli.py deploy --apk app.apk  install a build on every device
-    python cli.py serve                 HTTP + WebSocket API
+    python cli.py serve --fake          HTTP + WebSocket API, and a live console
 
 Only `serve` needs a third-party package. Everything else runs on a bare
 standard-library install, which is the difference between a project someone
@@ -77,9 +77,38 @@ def build_orchestrator(
     if os.environ.get("ORCH_CRED_FILE"):
         credentials.load_file(os.environ["ORCH_CRED_FILE"])
 
+    # A fake `serve` gets a phone fleet by default, because a dashboard showing
+    # two browser slots and nothing else demonstrates none of what this is for.
+    demo_phones: list[Device] = []
+    if fake and devices is None:
+        demo_phones = [
+            Device(id="demo-phone-1", transport="usb", model="Pixel", tags=("android",)),
+            Device(id="demo-phone-2", transport="tunnel", model="Galaxy", tags=("android",)),
+            Device(id="demo-phone-3", transport="tcp", model="Redmi", tags=("android",)),
+        ]
+
+    dark: set[str] = set()
+    should_fail = fake_should_fail
+    demo_hooks: Optional[DemoHooks] = None
+    if fake and fake_should_fail is None:
+        # The predicate closes over `dark`, so the HTTP route that darkens a
+        # device and the driver that stops answering are the same fact.
+        should_fail = lambda device_id: device_id in dark  # noqa: E731
+        demo_hooks = DemoHooks(dark, demo_phones or list(devices or ()), browser_count)
+
+        if probe is None:
+            async def probe(device: Device) -> bool:  # noqa: F811
+                # The probe and the drivers have to agree on what "reachable"
+                # means. Left alone, the health monitor probes a *fake* fleet
+                # with a *real* adb, every call fails, and the whole bench
+                # quarantines itself within a couple of intervals -- which is
+                # precisely what the first served run of this did, to a device
+                # nobody had touched.
+                return device.id not in dark
+
     android_factory = (
         FakeAppiumSessionFactory(
-            should_fail=fake_should_fail, step_delay_s=fake_step_delay_s
+            should_fail=should_fail, step_delay_s=fake_step_delay_s
         )
         if fake
         else AppiumSessionFactory(appium_url)
@@ -94,7 +123,7 @@ def build_orchestrator(
     if devices is not None:
         source: Any = StaticDeviceSource(list(devices) + slots)
     elif fake:
-        source = StaticDeviceSource(slots)
+        source = StaticDeviceSource(demo_phones + slots)
     else:
         # Browser slots are static; phones come from adb. Both land in the same
         # registry, which is the whole point of modelling a slot as a device.
@@ -121,7 +150,85 @@ def build_orchestrator(
         health_policy=health_policy,
         hub=EventHub(),
         probe=probe,
+        demo=demo_hooks,
     )
+
+
+class DemoHooks:
+    """The controls a scripted fleet needs and a real one must never have.
+
+    The dark set is shared with the fake session factories by closure, so
+    darkening a device is literally "this driver stops answering" -- no state
+    change, no event, no teardown. The health monitor then has to work it out
+    the same way it would with a phone that fell off its cable, which is the
+    only version of the demo worth showing.
+    """
+
+    def __init__(self, dark: set[str], phones: list[Device], browsers: int) -> None:
+        self._dark = dark
+        self._phones = phones
+        self._browsers = browsers
+
+    def darken(self, device_id: str) -> None:
+        self._dark.add(device_id)
+        log.warning("demo.device_darkened", device_id=device_id)
+
+    def revive(self, device_id: str) -> None:
+        self._dark.discard(device_id)
+        log.info("demo.device_revived", device_id=device_id)
+
+    def scenario(self) -> list[TaskSpec]:
+        """Enough work to keep every device busy for a while, plus one task that
+        can never be scheduled -- because "queued forever" and "impossible" look
+        the same on a dashboard until something distinguishes them."""
+
+        specs: list[TaskSpec] = []
+        for index in range(len(self._phones) * 3):
+            specs.append(
+                TaskSpec.from_dict(
+                    {
+                        "id": f"android-{index}",
+                        "kind": "android",
+                        "selector": {"tags": ["android"]},
+                        "timeout_s": 30,
+                        "max_attempts": 3,
+                        "steps": [
+                            {"op": "tap", "id": "start"},
+                            {"op": "wait", "seconds": 0.6},
+                            {"op": "read", "id": "status", "into": "status"},
+                        ],
+                    }
+                )
+            )
+        for index in range(max(self._browsers, 1)):
+            specs.append(
+                TaskSpec.from_dict(
+                    {
+                        "id": f"web-{index}",
+                        "kind": "web",
+                        "selector": {"tags": ["web"]},
+                        "timeout_s": 30,
+                        "steps": [
+                            {"op": "auth", "mode": "cookie", "realm": "demo"},
+                            {"op": "goto", "url": "https://example.test/"},
+                            {"op": "capture_session", "realm": "demo",
+                             "token_key": "access_token"},
+                            {"op": "read", "selector": "h1", "into": "heading"},
+                        ],
+                    }
+                )
+            )
+        specs.append(
+            TaskSpec.from_dict(
+                {
+                    "id": "impossible",
+                    "kind": "android",
+                    "selector": {"tags": ["ios"]},
+                    "timeout_s": 10,
+                }
+            )
+        )
+        return specs
 
 
 class _CompositeSource:
@@ -313,6 +420,11 @@ async def cmd_serve(args: argparse.Namespace) -> int:
         workers=args.workers,
     )
     app = create_app(orchestrator)
+    where = f"http://{args.host}:{args.port}/"
+    print(f"dashboard: {where}", file=sys.stderr)
+    if args.fake:
+        print("  fake fleet: darken a device from the page and watch it recover",
+              file=sys.stderr)
     config = uvicorn.Config(
         app, host=args.host, port=args.port, log_config=None, access_log=False
     )

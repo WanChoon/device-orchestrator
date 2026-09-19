@@ -48,7 +48,15 @@ class Orchestrator:
         health_policy: Optional[HealthPolicy] = None,
         hub: Optional[EventHub] = None,
         probe: Optional[Any] = None,
+        demo: Optional[Any] = None,
     ) -> None:
+        # `demo` is an object of controls that only make sense against a fake
+        # fleet -- darkening a device on command, submitting a scripted batch.
+        # It is passed in rather than switched on by a config flag, so a
+        # production wiring cannot accidentally expose a route that kills a
+        # phone: the routes do not exist unless something handed them a
+        # mechanism.
+        self.demo = demo
         self.hub = hub or EventHub()
         self.registry = DeviceRegistry(source)
         self.sessions = sessions or SessionManager()

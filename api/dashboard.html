@@ -1,0 +1,568 @@
+<!doctype html>
+<!--
+  A console for watching a fleet, served by the orchestrator itself.
+
+  One design note is worth stating because it is the whole reason this page is
+  not just a WebSocket reader: the event stream is a change log, not a source of
+  truth. `EventHub` bounds each subscriber's queue and drops oldest-first under
+  pressure -- deliberately, so a stalled browser tab can never stall the fleet.
+  A page that derived state purely from events would therefore drift, silently,
+  in exactly the busy moments when someone is watching it.
+
+  So the split is: the socket drives immediacy (an event lands, the feed moves,
+  a refresh is scheduled), and REST drives correctness (/devices and /tasks are
+  polled, and what they say wins). The heartbeat carries the server's drop count
+  so the page can say out loud when it has missed something.
+
+  No build step, no dependencies, no framework. It is one file the server reads
+  from disk per request, so editing it during a demo is a browser refresh.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fleet console</title>
+<style>
+  :root {
+    color-scheme: light dark;
+
+    --ground: #F4F5F3;
+    --surface: #FFFFFF;
+    --sunk: #EAECE8;
+    --ink: #15191A;
+    --ink-mid: #414947;
+    --ink-mute: #6B7370;
+    --rule: #DBDEDA;
+
+    --online: #1F6F5C;
+    --online-wash: #E2EFEA;
+    --suspect: #8A6410;
+    --suspect-wash: #F6EEDB;
+    --bad: #A04327;
+    --bad-wash: #F6E8E3;
+    --gone: #6B7370;
+    --gone-wash: #E8EAE6;
+
+    --mono: ui-monospace, "SF Mono", "Cascadia Mono", "JetBrains Mono", Consolas, monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ground: #0E1211;
+      --surface: #161A19;
+      --sunk: #1D2221;
+      --ink: #E5E9E6;
+      --ink-mid: #B2B9B6;
+      --ink-mute: #848B88;
+      --rule: #272D2B;
+
+      --online: #5FBFA3;
+      --online-wash: #13312A;
+      --suspect: #D6A648;
+      --suspect-wash: #33280F;
+      --bad: #E08163;
+      --bad-wash: #351C13;
+      --gone: #848B88;
+      --gone-wash: #1F2422;
+    }
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--ground);
+    color: var(--ink);
+    font: 14px/1.5 var(--sans);
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .shell {
+    max-width: 1440px;
+    margin: 0 auto;
+    padding: 20px 16px 40px;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+  }
+
+  /* ---------------------------------------------------------- header */
+
+  header.bar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 12px 20px;
+    padding: 14px 18px;
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-radius: 5px;
+  }
+
+  .brand {
+    font-family: var(--mono);
+    font-size: 13px;
+    font-weight: 600;
+    letter-spacing: .02em;
+    margin-right: auto;
+  }
+  .brand span { color: var(--ink-mute); font-weight: 400; }
+
+  .stats { display: flex; flex-wrap: wrap; gap: 14px; }
+  .stat {
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--ink-mute);
+  }
+  .stat b {
+    font-size: 15px;
+    color: var(--ink);
+    font-variant-numeric: tabular-nums;
+    font-weight: 600;
+  }
+  .stat.is-online b { color: var(--online); }
+  .stat.is-bad b { color: var(--bad); }
+
+  .link {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-family: var(--mono);
+    font-size: 12px;
+    padding: 4px 9px;
+    border-radius: 999px;
+    border: 1px solid var(--rule);
+    color: var(--ink-mute);
+  }
+  .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--gone); }
+  .link.up { color: var(--online); border-color: var(--online); background: var(--online-wash); }
+  .link.up .dot { background: var(--online); }
+  .link.down { color: var(--bad); border-color: var(--bad); background: var(--bad-wash); }
+  .link.down .dot { background: var(--bad); }
+
+  button {
+    font: inherit;
+    font-family: var(--mono);
+    font-size: 12px;
+    padding: 6px 12px;
+    border-radius: 4px;
+    border: 1px solid var(--rule);
+    background: var(--surface);
+    color: var(--ink);
+    cursor: pointer;
+  }
+  button:hover:not(:disabled) { border-color: var(--ink-mute); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  button:focus-visible { outline: 2px solid var(--online); outline-offset: 2px; }
+  button.primary { border-color: var(--online); color: var(--online); background: var(--online-wash); }
+  button.danger  { border-color: var(--bad); color: var(--bad); background: var(--bad-wash); }
+
+  .warn {
+    width: 100%;
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--bad);
+  }
+
+  /* ---------------------------------------------------------- layout */
+
+  .cols {
+    display: grid;
+    grid-template-columns: minmax(0, 5fr) minmax(0, 7fr);
+    gap: 16px;
+    align-items: start;
+  }
+  @media (max-width: 900px) { .cols { grid-template-columns: 1fr; } }
+
+  .panel {
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-radius: 5px;
+    overflow: hidden;
+  }
+  .panel > h2 {
+    margin: 0;
+    padding: 11px 16px;
+    font-family: var(--mono);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: .09em;
+    text-transform: uppercase;
+    color: var(--ink-mute);
+    border-bottom: 1px solid var(--rule);
+    background: var(--sunk);
+    display: flex;
+    justify-content: space-between;
+    gap: 10px;
+  }
+  .panel > h2 em { font-style: normal; font-weight: 400; letter-spacing: 0; text-transform: none; }
+
+  /* ---------------------------------------------------------- devices */
+
+  .devices { display: flex; flex-direction: column; }
+  .device {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 4px 12px;
+    padding: 13px 16px;
+    border-bottom: 1px solid var(--rule);
+  }
+  .device:last-child { border-bottom: 0; }
+
+  .device .id {
+    font-family: var(--mono);
+    font-size: 13px;
+    font-weight: 600;
+  }
+  .device .meta {
+    grid-column: 1;
+    font-family: var(--mono);
+    font-size: 11.5px;
+    color: var(--ink-mute);
+  }
+  .device .note {
+    grid-column: 1 / -1;
+    font-size: 12.5px;
+    color: var(--ink-mid);
+    margin-top: 2px;
+  }
+  .device .acts { grid-row: 1 / span 2; grid-column: 2; align-self: center; }
+
+  .tag {
+    display: inline-block;
+    font-family: var(--mono);
+    font-size: 10.5px;
+    font-weight: 600;
+    letter-spacing: .06em;
+    text-transform: uppercase;
+    padding: 2px 7px;
+    border-radius: 3px;
+    border: 1px solid transparent;
+  }
+  .tag.online      { color: var(--online); background: var(--online-wash); border-color: var(--online); }
+  .tag.suspect     { color: var(--suspect); background: var(--suspect-wash); border-color: var(--suspect); }
+  .tag.quarantined { color: var(--bad); background: var(--bad-wash); border-color: var(--bad); }
+  .tag.retired     { color: var(--gone); background: var(--gone-wash); border-color: var(--gone); }
+  .tag.leased      { color: var(--ink-mute); background: var(--sunk); border-color: var(--rule); }
+
+  /* ---------------------------------------------------------- tasks */
+
+  .scroll { max-height: 420px; overflow: auto; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td {
+    text-align: left;
+    padding: 8px 10px;
+    border-bottom: 1px solid var(--rule);
+    font-family: var(--mono);
+    font-size: 12px;
+    white-space: nowrap;
+  }
+  th {
+    position: sticky;
+    top: 0;
+    background: var(--surface);
+    font-size: 10.5px;
+    letter-spacing: .07em;
+    text-transform: uppercase;
+    color: var(--ink-mute);
+    font-weight: 600;
+  }
+  td.err { white-space: normal; color: var(--bad); font-family: var(--sans); font-size: 12px; }
+  td.num { font-variant-numeric: tabular-nums; }
+  tr:last-child td { border-bottom: 0; }
+
+  .st { font-weight: 600; }
+  .st.succeeded { color: var(--online); }
+  .st.running, .st.assigned { color: var(--suspect); }
+  .st.failed, .st.rejected { color: var(--bad); }
+  .st.abandoned { color: var(--gone); }
+  .st.pending { color: var(--ink-mute); }
+
+  /* ---------------------------------------------------------- feed */
+
+  .feed { max-height: 300px; overflow: auto; padding: 4px 0; }
+  .ev {
+    display: grid;
+    grid-template-columns: 78px 190px 1fr;
+    gap: 12px;
+    padding: 4px 16px;
+    font-family: var(--mono);
+    font-size: 12px;
+  }
+  @media (max-width: 640px) { .ev { grid-template-columns: 1fr; gap: 2px; } }
+  .ev .t { color: var(--ink-mute); font-variant-numeric: tabular-nums; }
+  .ev .k { font-weight: 600; }
+  .ev .d { color: var(--ink-mid); overflow-wrap: anywhere; }
+  .ev.device\.quarantined .k, .ev.device\.retired .k, .ev.device\.recovery_failed .k { color: var(--bad); }
+  .ev.device\.restored .k { color: var(--online); }
+
+  .empty { padding: 26px 16px; color: var(--ink-mute); font-size: 13px; }
+</style>
+</head>
+<body>
+<div class="shell">
+
+  <header class="bar">
+    <div class="brand">device-orchestrator <span>/ fleet console</span></div>
+
+    <div class="stats">
+      <div class="stat is-online"><b id="s-online">0</b> online</div>
+      <div class="stat is-bad"><b id="s-bad">0</b> unassignable</div>
+      <div class="stat"><b id="s-queue">0</b> queued</div>
+      <div class="stat"><b id="s-inflight">0</b> running</div>
+      <div class="stat"><b id="s-retry">0</b> in backoff</div>
+    </div>
+
+    <button id="run" class="primary" type="button">Run scenario</button>
+    <span id="link" class="link"><span class="dot"></span><span id="link-text">connecting</span></span>
+    <p id="warn" class="warn" hidden></p>
+  </header>
+
+  <div class="cols">
+    <section class="panel">
+      <h2>Devices <em id="d-count"></em></h2>
+      <div id="devices" class="devices">
+        <p class="empty">waiting for the first inventory refresh…</p>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Tasks <em id="t-count"></em></h2>
+      <div class="scroll">
+        <table>
+          <thead>
+            <tr><th>id</th><th>kind</th><th>state</th><th>try</th><th>device</th><th>detail</th></tr>
+          </thead>
+          <tbody id="tasks">
+            <tr><td colspan="6" class="empty">nothing submitted yet</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </div>
+
+  <section class="panel">
+    <h2>Event stream <em>live from /ws/progress · newest first</em></h2>
+    <div id="feed" class="feed">
+      <p class="empty">no events yet</p>
+    </div>
+  </section>
+
+</div>
+
+<script>
+(() => {
+  "use strict";
+
+  const $ = (id) => document.getElementById(id);
+  const MAX_FEED = 200;
+
+  let socket = null;
+  let backoff = 500;
+  let demoControls = false;
+  let refreshQueued = false;
+
+  // ------------------------------------------------------------- rendering
+
+  const escape = (value) =>
+    String(value).replace(/[&<>"']/g, (c) =>
+      ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+  function setLink(state, text) {
+    const el = $("link");
+    el.className = "link" + (state ? " " + state : "");
+    $("link-text").textContent = text;
+  }
+
+  function renderDevices(devices) {
+    $("d-count").textContent = devices.length ? `${devices.length} in inventory` : "";
+    const host = $("devices");
+    if (!devices.length) {
+      host.innerHTML = '<p class="empty">no devices</p>';
+      return;
+    }
+    host.innerHTML = devices.map((d) => {
+      const state = escape(d.state);
+      const dark = d.state !== "online";
+      const control = demoControls && d.transport !== "virtual"
+        ? `<button type="button" class="${dark ? "" : "danger"}" data-act="${dark ? "revive" : "darken"}" data-id="${escape(d.id)}">${dark ? "revive" : "stop answering"}</button>`
+        : "";
+      return `
+        <div class="device">
+          <div class="id">${escape(d.id)}</div>
+          <div class="meta">
+            ${escape(d.transport)} · ${escape(d.model || "—")}
+            ${d.recoveries ? ` · ${d.recoveries} recover${d.recoveries === 1 ? "y" : "ies"}` : ""}
+          </div>
+          <div class="acts">
+            <span class="tag ${state}">${state}</span>
+            ${d.leased ? '<span class="tag leased">leased</span>' : ""}
+            ${control}
+          </div>
+          ${d.note ? `<div class="note">${escape(d.note)}</div>` : ""}
+        </div>`;
+    }).join("");
+  }
+
+  function renderTasks(tasks) {
+    $("t-count").textContent = tasks.length ? `${tasks.length} submitted` : "";
+    const body = $("tasks");
+    if (!tasks.length) {
+      body.innerHTML = '<tr><td colspan="6" class="empty">nothing submitted yet</td></tr>';
+      return;
+    }
+    body.innerHTML = tasks.map((t) => {
+      const attempts = t.attempts || [];
+      const last = attempts[attempts.length - 1] || {};
+      const device = last.device_id || "—";
+      // A task that ran on more than one device is the single most interesting
+      // row on this page, so it is called out rather than left to be inferred.
+      const moved = new Set(attempts.map((a) => a.device_id).filter(Boolean)).size > 1;
+      return `
+        <tr>
+          <td>${escape(t.id)}</td>
+          <td>${escape(t.kind)}</td>
+          <td class="st ${escape(t.state)}">${escape(t.state)}</td>
+          <td class="num">${attempts.length}</td>
+          <td>${escape(device)}${moved ? " ↗" : ""}</td>
+          <td class="err">${t.error ? escape(t.error) : ""}</td>
+        </tr>`;
+    }).join("");
+  }
+
+  function pushEvent(event) {
+    const feed = $("feed");
+    if (feed.firstElementChild && feed.firstElementChild.className === "empty") {
+      feed.innerHTML = "";
+    }
+    const now = new Date();
+    const clock = now.toTimeString().slice(0, 8) +
+      "." + String(now.getMilliseconds()).padStart(3, "0");
+
+    let detail;
+    if (event.type === "task.state") {
+      detail = `${event.task_id} → ${event.state}` +
+        (event.device_id ? ` on ${event.device_id}` : "") +
+        (event.error ? ` — ${event.error}` : "");
+    } else if (event.type === "task.progress") {
+      detail = `${event.task_id} ${event.phase}: ${event.message || ""}`;
+    } else {
+      detail = [event.device_id, event.reason].filter(Boolean).join(" — ");
+    }
+
+    const row = document.createElement("div");
+    row.className = "ev " + event.type;
+    row.innerHTML =
+      `<span class="t">${clock}</span>` +
+      `<span class="k">${escape(event.type)}</span>` +
+      `<span class="d">${escape(detail)}</span>`;
+    feed.prepend(row);
+    while (feed.childElementCount > MAX_FEED) feed.lastElementChild.remove();
+  }
+
+  // ------------------------------------------------------------- transport
+
+  async function refresh() {
+    try {
+      const [health, devices, tasks] = await Promise.all([
+        fetch("healthz").then((r) => r.json()),
+        fetch("devices").then((r) => r.json()),
+        fetch("tasks").then((r) => r.json()),
+      ]);
+
+      demoControls = Boolean(health.demo_controls);
+      $("run").disabled = !demoControls;
+      $("run").title = demoControls ? "" : "this deployment has no demo fleet";
+
+      const inventory = devices.devices || [];
+      $("s-online").textContent = inventory.filter((d) => d.state === "online").length;
+      $("s-bad").textContent = inventory.filter((d) => d.state !== "online").length;
+
+      const sched = health.scheduler || {};
+      $("s-queue").textContent = sched.queue_depth ?? 0;
+      $("s-inflight").textContent = sched.inflight ?? 0;
+      $("s-retry").textContent = sched.pending_retries ?? 0;
+
+      renderDevices(inventory);
+      renderTasks(tasks.tasks || []);
+    } catch (err) {
+      setLink("down", "server unreachable");
+    }
+  }
+
+  // Events arrive faster than a repaint is worth, so a burst collapses into one
+  // fetch on the next frame instead of one fetch per event.
+  function scheduleRefresh() {
+    if (refreshQueued) return;
+    refreshQueued = true;
+    requestAnimationFrame(() => { refreshQueued = false; refresh(); });
+  }
+
+  function connect() {
+    const scheme = location.protocol === "https:" ? "wss" : "ws";
+    socket = new WebSocket(`${scheme}://${location.host}/ws/progress`);
+
+    socket.onopen = () => { backoff = 500; setLink("up", "live"); refresh(); };
+
+    socket.onmessage = (frame) => {
+      let event;
+      try { event = JSON.parse(frame.data); } catch { return; }
+
+      if (event.type === "heartbeat") {
+        // The server tells us how many events it threw away for this
+        // subscriber. Saying so is the difference between a stale dashboard
+        // and a dashboard that knows it is stale.
+        const dropped = event.dropped || 0;
+        $("warn").hidden = dropped === 0;
+        $("warn").textContent = dropped
+          ? `${dropped} event(s) dropped by the server for this connection — the feed below is incomplete. Device and task state are polled, so they remain correct.`
+          : "";
+        return;
+      }
+
+      pushEvent(event);
+      scheduleRefresh();
+    };
+
+    socket.onclose = () => {
+      setLink("down", "reconnecting");
+      // Capped exponential backoff: a browser tab left open overnight against a
+      // stopped server should not turn into a connection flood.
+      setTimeout(connect, backoff);
+      backoff = Math.min(backoff * 2, 10000);
+    };
+
+    socket.onerror = () => socket.close();
+  }
+
+  // ------------------------------------------------------------- controls
+
+  async function post(path) {
+    try {
+      await fetch(path, { method: "POST" });
+    } catch (err) {
+      /* the poll below will surface it */
+    }
+    refresh();
+  }
+
+  $("run").addEventListener("click", () => post("demo/scenario"));
+
+  $("devices").addEventListener("click", (e) => {
+    const button = e.target.closest("button[data-act]");
+    if (!button) return;
+    post(`demo/devices/${encodeURIComponent(button.dataset.id)}/${button.dataset.act}`);
+  });
+
+  // The socket gives immediacy; the poll gives correctness. Both run.
+  connect();
+  refresh();
+  setInterval(refresh, 2000);
+})();
+</script>
+</body>
+</html>

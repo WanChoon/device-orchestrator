@@ -73,6 +73,13 @@ jobs:
           done
           curl -fsS "http://127.0.0.1:8099/healthz" | tee /dev/stderr | grep -q '"ready": *true'
           curl -fsS "http://127.0.0.1:8099/devices" >/dev/null
+          # The console is served from disk per request, so a rename or a bad
+          # path is a 500 that no unit test would notice.
+          curl -fsS "http://127.0.0.1:8099/" | grep -q "ws/progress"
+          # Submit the scripted run and darken a device over HTTP, which is
+          # exactly what the console's buttons do.
+          curl -fsS -X POST "http://127.0.0.1:8099/demo/scenario" >/dev/null
+          curl -fsS -X POST "http://127.0.0.1:8099/demo/devices/demo-phone-3/darken" >/dev/null
 
   no-dependencies:
     # Deliberately no `pip install`. `core/`, `targets/` and every subcommand
@@ -87,19 +94,21 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Nothing third-party reaches the CLI or the tests
+      - name: The CLI imports with nothing installed
+        # The layering rule itself is asserted statically in tests/test_layering.py,
+        # which works on any machine. This step proves the other half: that the
+        # import actually succeeds when the packages are genuinely absent.
         run: |
-          python - <<'EOF'
-          import sys, unittest
-          sys.argv = ["cli.py"]
-          __import__("cli")
-          unittest.TestLoader().discover("tests")
-          third_party = {"fastapi", "uvicorn", "starlette", "pydantic", "playwright"}
-          found = sorted(m for m in sys.modules if m.split(".")[0] in third_party)
-          if found:
-              raise SystemExit(f"third-party imports leaked into the core path: {found}")
-          print("clean")
-          EOF
+          python -c "import sys; sys.argv=['cli.py']; __import__('cli'); print('cli imported')"
+          python -c "
+          import sys
+          web = {'fastapi', 'uvicorn', 'starlette', 'pydantic'}
+          sys.argv = ['cli.py']
+          __import__('cli')
+          leaked = sorted(m for m in sys.modules if m.split('.')[0] in web)
+          assert not leaked, f'web stack reached the CLI: {leaked}'
+          print('no web stack in the CLI import path')
+          "
 
       - name: Unit tests, standard library only
         run: python -m unittest discover -s tests

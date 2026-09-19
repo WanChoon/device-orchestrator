@@ -9,11 +9,15 @@ working unattended, and reports progress over WebSocket.
 ```bash
 python cli.py demo                    # full run: no install, no adb, no Appium, no browser
 python cli.py deploy --fake           # APK rollout across a fleet, no phone needed
-python -m unittest discover -s tests  # 51 tests, ~5s
+python -m unittest discover -s tests  # 65 tests, ~5s
 
 pip install -r requirements.txt       # only `serve` needs anything
-python cli.py serve --fake            # HTTP + WebSocket on :8080
+python cli.py serve --fake            # live console on http://127.0.0.1:8080/
 ```
+
+`serve --fake` brings up a three-phone fleet and a console you can watch: click
+**stop answering** on a phone and the queue re-routes in front of you. That is
+the same run as `demo`, with the trace on screen instead of in the terminal.
 
 Everything except `serve` runs on a bare standard-library install — no FastAPI,
 no Playwright, no Appium, nothing to download. That is enforced by a CI job
@@ -297,6 +301,38 @@ key and asking a KMS. `SecretBox` is the single seam either answer plugs into.
 
 ---
 
+## The console
+
+`serve` publishes a single-file page at `/` that renders the fleet live. It is
+worth describing because of one decision that is easy to get backwards.
+
+**The socket is a change log; REST is the truth.** `EventHub` bounds every
+subscriber's queue and drops oldest-first under pressure — deliberately, so a
+stalled browser tab can never stall the fleet. A page that derived its state
+purely from that stream would therefore drift, silently, in precisely the busy
+moments when someone is watching it. So the console listens for immediacy (an
+event lands, the feed moves, a refresh is scheduled) and polls `/devices` and
+`/tasks` for correctness. When the two disagree, the poll wins.
+
+The heartbeat carries that subscriber's server-side drop count, and the page
+says out loud when it is non-zero. A feed that silently skips events is worse
+than one that admits to it: a dashboard showing stale state looks exactly like a
+dashboard showing current state.
+
+The controls that darken a device are passed into the `Orchestrator` as an
+object, not enabled by a config flag. Against a real fleet nothing is handed in,
+so the routes return 404 — not 403, because "forbidden" would imply a deployment
+where a button that kills a phone might legitimately exist. Darkening does not
+mark the device unwell, publish an event or tear down its session; the driver
+simply stops answering, and everything after that is the system working it out
+on its own. That is the only version of the demo worth showing.
+
+The page loads nothing from the network — no CDN, no fonts, no framework —
+because a console is most needed on the bench that has no route to the internet.
+A test asserts it.
+
+---
+
 ## Logging
 
 Every line is one JSON object. There is no human-readable mode.
@@ -414,9 +450,10 @@ targets/android.py      Appium W3C client + AndroidTarget + fakes
 targets/web.py          Playwright + WebTarget + auth ops + fakes + slots
 targets/apk.py          install / verify / launch, the blame taxonomy, FakeAdb
 api/server.py           FastAPI routes -- the only module that imports FastAPI
+api/dashboard.html      the live console: one file, no build step, no CDN
 api/ws.py               EventHub, bounded fan-out, heartbeats
 obs/log.py              JSON formatter, correlation-id context
-tests/                  51 tests, mostly failure paths
+tests/                  65 tests, mostly failure paths and layering rules
 .github/workflows/      tests + demo + rollout + booted API on 3.11-3.13, and a
                         job that installs nothing at all
 ```
@@ -430,6 +467,8 @@ tests/                  51 tests, mostly failure paths
 | `POST /tasks` | submit a `TaskSpec`; `202` with the record, `422` if malformed |
 | `GET /tasks/{id}` | one task, with every attempt and which device it used |
 | `WS /ws/progress` | live `task.state` / `task.progress` / `device.*` events |
+| `GET /` | the console |
+| `POST /demo/*` | scripted run and device kill switch; 404 without a fake fleet |
 
 `/healthz` separates liveness from readiness on purpose: the process can be
 perfectly healthy with nothing to run work on, and a deploy pipeline that

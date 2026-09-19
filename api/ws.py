@@ -79,12 +79,17 @@ class EventHub:
 
         Without the heartbeat an idle fleet looks identical to a dead server to
         anything sitting behind a proxy that reaps quiet connections.
+
+        The heartbeat carries this subscriber's drop count, because a feed that
+        silently skips events is worse than one that admits to it: a dashboard
+        showing a stale device state is indistinguishable from a dashboard
+        showing a current one, unless it knows it missed something.
         """
         while True:
             try:
                 event = await asyncio.wait_for(subscriber.queue.get(), timeout=heartbeat_s)
             except asyncio.TimeoutError:
-                yield {"type": "heartbeat"}
+                yield {"type": "heartbeat", "dropped": subscriber.dropped}
                 continue
             yield event
 

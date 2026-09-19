@@ -11,10 +11,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, WebSocket
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 
 from api.ws import pump_websocket
 from core.orchestrator import Orchestrator
@@ -32,6 +33,12 @@ def create_app(orchestrator: Orchestrator) -> FastAPI:
 
     app = FastAPI(title="device-orchestrator", version="0.1.0", lifespan=lifespan)
 
+    @app.get("/", response_class=HTMLResponse)
+    async def dashboard() -> str:
+        # Read per request rather than cached at import, so editing the page
+        # during a demo is a browser refresh rather than a restart.
+        return (Path(__file__).with_name("dashboard.html")).read_text(encoding="utf-8")
+
     @app.get("/healthz")
     async def healthz() -> dict[str, Any]:
         devices = orchestrator.registry.snapshot()
@@ -46,6 +53,9 @@ def create_app(orchestrator: Orchestrator) -> FastAPI:
             "devices_online": len(assignable),
             "scheduler": orchestrator.scheduler.stats(),
             "ws_subscribers": orchestrator.hub.subscriber_count,
+            # The dashboard renders its controls from this, rather than assuming
+            # they exist and discovering otherwise on a 404 after a click.
+            "demo_controls": orchestrator.demo is not None,
         }
 
     @app.get("/devices")
@@ -80,6 +90,33 @@ def create_app(orchestrator: Orchestrator) -> FastAPI:
         if record is None:
             raise HTTPException(status_code=404, detail="no such task")
         return record.to_dict()
+
+    def _demo() -> Any:
+        if orchestrator.demo is None:
+            # Not 403: against a real fleet these routes genuinely do not exist,
+            # and saying "forbidden" would imply a deployment where they might.
+            raise HTTPException(status_code=404, detail="no demo fleet in this deployment")
+        return orchestrator.demo
+
+    @app.post("/demo/scenario", status_code=202)
+    async def demo_scenario() -> dict[str, Any]:
+        specs = _demo().scenario()
+        records = [orchestrator.scheduler.submit(spec) for spec in specs]
+        return {"submitted": [r.spec.id for r in records]}
+
+    @app.post("/demo/devices/{device_id}/darken")
+    async def demo_darken(device_id: str) -> dict[str, Any]:
+        _demo().darken(device_id)
+        # Nothing else happens here on purpose. The device is not marked unwell,
+        # no event is published, no session is torn down -- it simply stops
+        # answering, which is exactly what a phone that has come off its cable
+        # does. Everything after this is the system noticing on its own.
+        return {"device_id": device_id, "answering": False}
+
+    @app.post("/demo/devices/{device_id}/revive")
+    async def demo_revive(device_id: str) -> dict[str, Any]:
+        _demo().revive(device_id)
+        return {"device_id": device_id, "answering": True}
 
     @app.websocket("/ws/progress")
     async def progress_socket(websocket: WebSocket) -> None:
