@@ -22,7 +22,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from api.server import Orchestrator  # noqa: E402
+from core.orchestrator import Orchestrator  # noqa: E402
 from api.ws import EventHub  # noqa: E402
 from core.auth import (  # noqa: E402
     AuthError,

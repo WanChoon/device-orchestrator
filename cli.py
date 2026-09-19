@@ -4,7 +4,12 @@
     python cli.py demo                  end-to-end run, no adb/appium/browser needed
     python cli.py devices               what adb currently sees
     python cli.py run --file task.json  submit one task and wait for it
+    python cli.py deploy --apk app.apk  install a build on every device
     python cli.py serve                 HTTP + WebSocket API
+
+Only `serve` needs a third-party package. Everything else runs on a bare
+standard-library install, which is the difference between a project someone
+evaluates and a project someone means to get around to.
 
 `demo` exists because the interesting behaviour of this system is what happens
 when a device stops answering, and that is exactly the behaviour you cannot show
@@ -24,11 +29,11 @@ import tempfile
 from pathlib import Path
 from typing import Any, Optional
 
-from api.server import Orchestrator, create_app
 from api.ws import EventHub
 from core.auth import CookieJar, CredentialStore, SecretBox, TokenCache
 from core.device import Adb, AdbDeviceSource, Device, StaticDeviceSource
 from core.health import HealthPolicy
+from core.orchestrator import Orchestrator
 from core.scheduler import SchedulerPolicy
 from core.session import SessionManager
 from core.task import FatalError, TaskSpec, TaskState
@@ -294,7 +299,12 @@ async def cmd_deploy(args: argparse.Namespace) -> int:
 
 
 async def cmd_serve(args: argparse.Namespace) -> int:
+    # FastAPI and uvicorn are imported here, not at module scope, so every other
+    # subcommand runs on a bare standard-library install. `demo` is the thing a
+    # reviewer runs first, and it should not require a dependency it never uses.
     import uvicorn
+
+    from api.server import create_app
 
     orchestrator = build_orchestrator(
         fake=args.fake,

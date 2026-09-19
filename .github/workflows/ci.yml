@@ -74,6 +74,42 @@ jobs:
           curl -fsS "http://127.0.0.1:8099/healthz" | tee /dev/stderr | grep -q '"ready": *true'
           curl -fsS "http://127.0.0.1:8099/devices" >/dev/null
 
+  no-dependencies:
+    # Deliberately no `pip install`. `core/`, `targets/` and every subcommand
+    # but `serve` are supposed to run on a bare standard library, and the only
+    # way a claim like that stays true is if something checks it. CI caught the
+    # first violation the day this file was added: `cli.py` imported FastAPI
+    # transitively through the Orchestrator, so `demo` could not run without it.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Nothing third-party reaches the CLI or the tests
+        run: |
+          python - <<'EOF'
+          import sys, unittest
+          sys.argv = ["cli.py"]
+          __import__("cli")
+          unittest.TestLoader().discover("tests")
+          third_party = {"fastapi", "uvicorn", "starlette", "pydantic", "playwright"}
+          found = sorted(m for m in sys.modules if m.split(".")[0] in third_party)
+          if found:
+              raise SystemExit(f"third-party imports leaked into the core path: {found}")
+          print("clean")
+          EOF
+
+      - name: Unit tests, standard library only
+        run: python -m unittest discover -s tests
+
+      - name: The demo runs with nothing installed
+        run: python cli.py --log-level WARNING demo --wait 60
+
+      - name: The rollout runs with nothing installed
+        run: python cli.py --log-level WARNING deploy --fake --package com.example.demo
+
   checks:
     runs-on: ubuntu-latest
     steps:

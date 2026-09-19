@@ -7,12 +7,18 @@ device or a browser, deploys builds across a phone fleet, keeps that fleet
 working unattended, and reports progress over WebSocket.
 
 ```bash
-pip install -r requirements.txt
-python cli.py demo                    # full run, no adb / Appium / browser needed
+python cli.py demo                    # full run: no install, no adb, no Appium, no browser
 python cli.py deploy --fake           # APK rollout across a fleet, no phone needed
 python -m unittest discover -s tests  # 51 tests, ~5s
+
+pip install -r requirements.txt       # only `serve` needs anything
 python cli.py serve --fake            # HTTP + WebSocket on :8080
 ```
+
+Everything except `serve` runs on a bare standard-library install — no FastAPI,
+no Playwright, no Appium, nothing to download. That is enforced by a CI job
+rather than asserted here, because it stopped being true within a day of the
+workflow being added.
 
 `demo` scripts a three-phone fleet in which one phone goes dark two seconds in.
 It is the fastest way to see what this project is actually about, which is not
@@ -62,6 +68,7 @@ made in two places.**
 | `core/health.py` | When a device is sick, how to fix it, and when to stop trying |
 | `core/scheduler.py` | Which work runs next, on what, and whether to retry |
 | `core/auth.py` | Where secrets live, when a token is stale, who may log in |
+| `core/orchestrator.py` | How the parts are wired together and started |
 | `targets/*.py` | How to turn steps into commands for one backend |
 | `api/*.py` | How the outside world submits work and watches it |
 | `obs/log.py` | What a log line looks like |
@@ -402,14 +409,16 @@ core/session.py         SessionManager: reconnect, backoff, generations
 core/health.py          probe -> quarantine -> recover -> retire
 core/scheduler.py       asyncio worker pool, leases, deadlines, retry
 core/auth.py            Secret, SecretBox, JWT expiry, TokenCache, CookieJar
+core/orchestrator.py    assembly and lifecycle; the only place that knows the wiring
 targets/android.py      Appium W3C client + AndroidTarget + fakes
 targets/web.py          Playwright + WebTarget + auth ops + fakes + slots
 targets/apk.py          install / verify / launch, the blame taxonomy, FakeAdb
-api/server.py           FastAPI routes, Orchestrator wiring
+api/server.py           FastAPI routes -- the only module that imports FastAPI
 api/ws.py               EventHub, bounded fan-out, heartbeats
 obs/log.py              JSON formatter, correlation-id context
 tests/                  51 tests, mostly failure paths
-.github/workflows/      unit tests + demo + rollout + a booted API, on 3.11-3.13
+.github/workflows/      tests + demo + rollout + booted API on 3.11-3.13, and a
+                        job that installs nothing at all
 ```
 
 ## API

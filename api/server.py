@@ -1,91 +1,24 @@
 """FastAPI surface over the scheduler.
 
 The HTTP layer owns no state. It holds a reference to an `Orchestrator` that was
-assembled elsewhere and translates between JSON and the core types. Everything
-it can do, `cli.py` can also do without it -- which is the test that the split
-is real rather than decorative.
+assembled in `core/orchestrator.py` and translates between JSON and the core
+types. Everything it can do, `cli.py` can also do without it -- and this module
+is the only one in the project that imports FastAPI, which is what makes that
+claim checkable rather than aspirational.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
-from typing import Any, Optional
+from typing import Any
 
 from fastapi import FastAPI, HTTPException, WebSocket
 from fastapi.responses import JSONResponse
 
-from api.ws import EventHub, pump_websocket
-from core.device import Adb, DeviceRegistry, DeviceSource
-from core.health import HealthMonitor, HealthPolicy
-from core.scheduler import Scheduler, SchedulerPolicy
-from core.session import SessionManager
-from core.task import FatalError, Target, TaskSpec
-from obs.log import get_logger
-
-log = get_logger("api.server")
-
-
-class Orchestrator:
-    """Assembles the parts and owns their lifecycle.
-
-    This is the only place that knows the wiring. Tests build one of these with
-    fake sources and fake factories; production builds one with adb and Appium.
-    Nothing downstream has to care which.
-    """
-
-    def __init__(
-        self,
-        *,
-        source: DeviceSource,
-        targets: dict[str, Target],
-        adb: Optional[Adb] = None,
-        sessions: Optional[SessionManager] = None,
-        scheduler_policy: Optional[SchedulerPolicy] = None,
-        health_policy: Optional[HealthPolicy] = None,
-        hub: Optional[EventHub] = None,
-        probe: Optional[Any] = None,
-    ) -> None:
-        self.hub = hub or EventHub()
-        self.registry = DeviceRegistry(source)
-        self.sessions = sessions or SessionManager()
-        self.adb = adb or Adb()
-        self.health = HealthMonitor(
-            self.registry,
-            self.adb,
-            self.sessions,
-            policy=health_policy,
-            sink=self.hub.publish,
-            probe=probe,
-        )
-        self.scheduler = Scheduler(
-            self.registry,
-            targets,
-            policy=scheduler_policy,
-            sink=self.hub.publish,
-            health=self.health,
-        )
-        self._started = False
-
-    async def start(self) -> None:
-        if self._started:
-            return
-        # Refresh before the workers start so the first task does not wait a
-        # full health interval to discover that devices exist.
-        await self.registry.refresh()
-        await self.health.start()
-        await self.scheduler.start()
-        self._started = True
-        log.info("orchestrator.started", devices=len(self.registry.all()))
-
-    async def stop(self) -> None:
-        if not self._started:
-            return
-        await self.scheduler.stop()
-        await self.health.stop()
-        await self.sessions.close_all()
-        self._started = False
-        log.info("orchestrator.stopped")
+from api.ws import pump_websocket
+from core.orchestrator import Orchestrator
+from core.task import FatalError, TaskSpec
 
 
 def create_app(orchestrator: Orchestrator) -> FastAPI:
