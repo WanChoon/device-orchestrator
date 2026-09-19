@@ -1,0 +1,48 @@
+[
+  {
+    "id": "web-login-once",
+    "kind": "web",
+    "selector": { "tags": ["web"] },
+    "timeout_s": 90,
+    "max_attempts": 2,
+    "steps": [
+      { "op": "auth", "mode": "cookie", "realm": "demo-portal" },
+      { "op": "goto", "url": "https://portal.example.test/login" },
+      { "op": "fill", "selector": "#username", "text": "demo-user" },
+      { "op": "click", "selector": "button[type=submit]" },
+      { "op": "wait", "seconds": 1 },
+      {
+        "op": "capture_session",
+        "realm": "demo-portal",
+        "token_key": "access_token"
+      }
+    ]
+  },
+  {
+    "id": "web-work-on-the-shared-session",
+    "kind": "web",
+    "selector": { "tags": ["web"] },
+    "timeout_s": 60,
+    "steps": [
+      { "op": "auth", "mode": "cookie", "realm": "demo-portal" },
+      { "op": "goto", "url": "https://portal.example.test/accounts" },
+      { "op": "read", "selector": ".balance", "into": "balance" }
+    ]
+  },
+  {
+    "id": "api-style-bearer",
+    "kind": "web",
+    "selector": { "tags": ["web"] },
+    "timeout_s": 60,
+    "steps": [
+      {
+        "op": "auth",
+        "mode": "bearer",
+        "credential": "demo-api",
+        "realm": "demo-api"
+      },
+      { "op": "goto", "url": "https://api.example.test/v1/whoami" },
+      { "op": "read", "selector": "pre", "into": "identity" }
+    ]
+  }
+]

@@ -1,0 +1,48 @@
+[
+  {
+    "id": "rollout-phone-1",
+    "kind": "apk",
+    "selector": { "device_id": "phone-1" },
+    "timeout_s": 300,
+    "max_attempts": 2,
+    "steps": [
+      {
+        "op": "install",
+        "path": "build/outputs/apk/release/app-release.apk",
+        "package": "com.example.app",
+        "reinstall": true,
+        "grant_permissions": true,
+        "timeout_s": 240
+      },
+      {
+        "op": "verify",
+        "package": "com.example.app",
+        "expect_version_name": "1.4.2"
+      },
+      { "op": "launch", "package": "com.example.app" }
+    ]
+  },
+  {
+    "id": "rollout-phone-2",
+    "kind": "apk",
+    "selector": { "device_id": "phone-2" },
+    "timeout_s": 300,
+    "max_attempts": 2,
+    "steps": [
+      {
+        "op": "install",
+        "path": "build/outputs/apk/release/app-release.apk",
+        "package": "com.example.app",
+        "reinstall": true,
+        "grant_permissions": true,
+        "timeout_s": 240
+      },
+      {
+        "op": "verify",
+        "package": "com.example.app",
+        "expect_version_name": "1.4.2"
+      },
+      { "op": "launch", "package": "com.example.app" }
+    ]
+  }
+]

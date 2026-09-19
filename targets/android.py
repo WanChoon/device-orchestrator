@@ -20,6 +20,7 @@ import urllib.error
 import urllib.request
 from typing import Any, Callable, Optional
 
+from core.auth import AuthError, CredentialStore
 from core.device import Device, Lease
 from core.session import SessionHandle, SessionManager
 from core.task import (
@@ -288,9 +289,16 @@ class AndroidTarget(Target):
 
     kind = "android"
 
-    def __init__(self, sessions: SessionManager, factory: Any) -> None:
+    def __init__(
+        self,
+        sessions: SessionManager,
+        factory: Any,
+        *,
+        credentials: Optional[CredentialStore] = None,
+    ) -> None:
         self._sessions = sessions
         self._factory = factory
+        self._credentials = credentials
 
     async def execute(
         self, spec: TaskSpec, lease: Lease, ctx: TaskContext
@@ -330,6 +338,13 @@ class AndroidTarget(Target):
             element = await driver.find(*_locator(step))
             await driver.send_keys(element, str(step.get("text", "")))
             return {}
+        if op == "type_secret":
+            # The same rule the web target follows: a spec crosses HTTP and is
+            # written to the log on every state change, so it carries a
+            # reference and the value is resolved here, at the keystroke.
+            element = await driver.find(*_locator(step))
+            await driver.send_keys(element, self._reveal(step))
+            return {}
         if op == "read":
             element = await driver.find(*_locator(step))
             text = await driver.text_of(element)
@@ -342,6 +357,26 @@ class AndroidTarget(Target):
         # An unknown op is a bug in the caller, not a flaky device. Retrying it
         # on another phone would waste the whole fleet failing the same way.
         raise FatalError(f"unknown android op: {op!r}")
+
+    def _reveal(self, step: dict[str, Any]) -> str:
+        ref = step.get("credential")
+        if not ref:
+            raise FatalError("type_secret needs a credential reference")
+        if self._credentials is None:
+            raise FatalError("this deployment has no credential store configured")
+        try:
+            credential = self._credentials.resolve(str(ref))
+        except AuthError as exc:
+            # Missing or wrong credentials fail the same way on every phone.
+            raise FatalError(str(exc)) from exc
+        field = str(step.get("field", "password"))
+        if field == "username":
+            if credential.username is None:
+                raise FatalError(f"credential {ref} has no username")
+            return credential.username
+        if credential.secret is None:
+            raise FatalError(f"credential {ref} has no secret")
+        return credential.secret.reveal()
 
 
 def _locator(step: dict[str, Any]) -> tuple[str, str]:

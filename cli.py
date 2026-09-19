@@ -18,12 +18,15 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any, Optional
 
 from api.server import Orchestrator, create_app
 from api.ws import EventHub
+from core.auth import CookieJar, CredentialStore, SecretBox, TokenCache
 from core.device import Adb, AdbDeviceSource, Device, StaticDeviceSource
 from core.health import HealthPolicy
 from core.scheduler import SchedulerPolicy
@@ -31,6 +34,7 @@ from core.session import SessionManager
 from core.task import FatalError, TaskSpec, TaskState
 from obs.log import configure, get_logger
 from targets.android import AndroidTarget, AppiumSessionFactory, FakeAppiumSessionFactory
+from targets.apk import ApkTarget, FakeAdb
 from targets.web import (
     FakeBrowserSessionFactory,
     PLAYWRIGHT_AVAILABLE,
@@ -56,6 +60,17 @@ def build_orchestrator(
 ) -> Orchestrator:
     adb = Adb()
     sessions = SessionManager()
+
+    # One credential store, one token cache and one cookie jar per process, all
+    # shared by every worker. That sharing is the point: it is what makes a
+    # login cost one request for the fleet instead of one request per task.
+    credentials = CredentialStore(
+        SecretBox(os.environ["ORCH_SECRET_KEY"])
+        if os.environ.get("ORCH_SECRET_KEY")
+        else None
+    )
+    if os.environ.get("ORCH_CRED_FILE"):
+        credentials.load_file(os.environ["ORCH_CRED_FILE"])
 
     android_factory = (
         FakeAppiumSessionFactory(
@@ -83,8 +98,17 @@ def build_orchestrator(
     return Orchestrator(
         source=source,
         targets={
-            "android": AndroidTarget(sessions, android_factory),
-            "web": WebTarget(sessions, web_factory),
+            "android": AndroidTarget(sessions, android_factory, credentials=credentials),
+            "web": WebTarget(
+                sessions,
+                web_factory,
+                credentials=credentials,
+                tokens=TokenCache(),
+                cookies=CookieJar(),
+            ),
+            # Deployment holds no session, which is the test of whether the
+            # Target contract was really about sessions or really about work.
+            "apk": ApkTarget(FakeAdb() if fake else adb),
         },
         adb=adb,
         sessions=sessions,
@@ -162,6 +186,111 @@ async def cmd_run(args: argparse.Namespace) -> int:
         return 1 if failed else 0
     finally:
         await orchestrator.stop()
+
+
+async def cmd_deploy(args: argparse.Namespace) -> int:
+    """Fan a build out to every phone on the bench.
+
+    Deployment is the one workload in this system where late binding is wrong.
+    Everywhere else a task wants *a* device and the queue decides which; a
+    rollout wants *every* device, so it submits one task pinned per device and
+    the rollout result is the set of them. That pinning goes through the same
+    `selector.device_id` every other task can use -- there is no separate
+    rollout mechanism, and adding one would mean maintaining retry, health and
+    reporting twice.
+    """
+
+    apk_path = args.apk
+    placeholder: Optional[tempfile.TemporaryDirectory] = None
+    if args.fake and not apk_path:
+        # So the pipeline (hash -> install -> verify) is runnable with no phone
+        # and no build. It is bytes on disk, not an APK, and adb is faked too.
+        placeholder = tempfile.TemporaryDirectory()
+        apk_path = str(Path(placeholder.name) / "placeholder.apk")
+        Path(apk_path).write_bytes(b"not-an-apk\n" * 4096)
+    if not apk_path:
+        print("--apk is required (or use --fake)", file=sys.stderr)
+        return 2
+
+    devices = None
+    if args.fake:
+        devices = [
+            Device(id=f"deploy-phone-{n}", transport="usb", model="Pixel", tags=("android",))
+            for n in (1, 2, 3)
+        ]
+
+    orchestrator = build_orchestrator(
+        fake=args.fake,
+        appium_url=args.appium_url,
+        browser_count=0,
+        workers=args.workers,
+        devices=devices,
+    )
+    await orchestrator.start()
+    try:
+        targets = [
+            device["id"]
+            for device in orchestrator.registry.snapshot()
+            if device["transport"] != "virtual"
+        ]
+        if not targets:
+            print("no devices to deploy to", file=sys.stderr)
+            return 2
+
+        steps: list[dict[str, Any]] = [
+            {"op": "install", "path": apk_path, "package": args.package,
+             "reinstall": True, "grant_permissions": args.grant},
+        ]
+        if args.package:
+            # Verification is a separate step because a package manager that
+            # said Success and a phone that runs the new build are different
+            # claims, and only the second one is the thing you wanted.
+            verify: dict[str, Any] = {"op": "verify", "package": args.package}
+            if args.expect_version:
+                verify["expect_version_name"] = args.expect_version
+            steps.append(verify)
+            if args.launch:
+                steps.append({"op": "launch", "package": args.package})
+
+        records = [
+            orchestrator.scheduler.submit(
+                TaskSpec.from_dict(
+                    {
+                        "kind": "apk",
+                        "steps": steps,
+                        "selector": {"device_id": device_id},
+                        "timeout_s": args.timeout,
+                        "max_attempts": args.attempts,
+                    }
+                )
+            )
+            for device_id in targets
+        ]
+
+        await orchestrator.scheduler.drain(timeout=args.wait)
+
+        print(f"\n=== rollout: {Path(apk_path).name} -> {len(targets)} device(s) ===")
+        failed = 0
+        for record, device_id in zip(records, targets):
+            fresh = orchestrator.scheduler.get(record.spec.id)
+            assert fresh is not None
+            data = fresh.to_dict()
+            digest = (data.get("result") or {}).get("captured", {}).get("sha256", "")
+            print(
+                f"  {device_id:<18} {data['state']:<10} attempts={len(data['attempts'])} "
+                f"{digest[:12]} {data['error'] or ''}"
+            )
+            if fresh.state is not TaskState.SUCCEEDED:
+                failed += 1
+        # A partial rollout is a failure with a list, not a success with a
+        # warning: the fleet is now running two builds and every result after
+        # this point depends on which phone a task happened to land on.
+        print(f"  {len(targets) - failed}/{len(targets)} succeeded")
+        return 1 if failed else 0
+    finally:
+        await orchestrator.stop()
+        if placeholder is not None:
+            placeholder.cleanup()
 
 
 async def cmd_serve(args: argparse.Namespace) -> int:
@@ -339,6 +468,18 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--wait", type=float, default=300.0)
     common(run_parser)
     run_parser.set_defaults(func=cmd_run)
+
+    deploy_parser = subparsers.add_parser("deploy", help="install an APK on every device")
+    deploy_parser.add_argument("--apk", help="path to the build (omit with --fake)")
+    deploy_parser.add_argument("--package", help="applicationId, needed to verify")
+    deploy_parser.add_argument("--expect-version", help="fail unless versionName matches")
+    deploy_parser.add_argument("--grant", action="store_true", help="adb install -g")
+    deploy_parser.add_argument("--launch", action="store_true", help="start it after install")
+    deploy_parser.add_argument("--timeout", type=float, default=300.0)
+    deploy_parser.add_argument("--attempts", type=int, default=2)
+    deploy_parser.add_argument("--wait", type=float, default=600.0)
+    common(deploy_parser)
+    deploy_parser.set_defaults(func=cmd_deploy)
 
     serve_parser = subparsers.add_parser("serve", help="HTTP + WebSocket API")
     serve_parser.add_argument("--host", default="127.0.0.1")
