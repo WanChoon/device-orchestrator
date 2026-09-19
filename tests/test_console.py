@@ -113,6 +113,38 @@ class DashboardFileTests(unittest.TestCase):
     def test_it_acknowledges_a_click_before_the_round_trip(self) -> None:
         self.assertIn("silencedAt.set", self.html)
 
+    def test_device_rows_are_patched_not_rebuilt(self) -> None:
+        """A click needs mousedown and mouseup on the same element.
+
+        The first version rebuilt the device list's innerHTML on every update,
+        including from a 250ms timer that ticks while anything is silent. That
+        destroyed the revive button four times a second, so clicks on it were
+        swallowed -- and only on that button, because nothing is counting up
+        until a device has been silenced. Rows are keyed and patched in place
+        now; this fails if anyone reintroduces the wholesale rebuild.
+        """
+
+        body = self.html[self.html.index("function renderDevices"):]
+        body = body[: body.index("function renderTasks")]
+
+        rebuilds = [
+            line.strip()
+            for line in body.splitlines()
+            if "innerHTML" in line and "empty" not in line
+        ]
+        self.assertEqual(
+            rebuilds, [], f"renderDevices rebuilds markup instead of patching: {rebuilds}"
+        )
+        # Keyed rows are what makes patching possible at all.
+        self.assertIn("rows.get(id)", self.html)
+        self.assertIn("rows.delete(id)", self.html)
+
+    def test_a_control_request_cannot_be_double_fired(self) -> None:
+        # The repaint owns the button's disabled state, so the handler cannot
+        # rely on having set it: an in-flight set is the thing both agree on.
+        self.assertIn("inFlight.has(id)", self.html)
+        self.assertIn("inFlight.has(d.id)", self.html)
+
     def test_it_loads_nothing_from_the_network(self) -> None:
         # An operator console that pulls a font or a framework from a CDN is
         # broken on exactly the bench that needs it most: an isolated one. This

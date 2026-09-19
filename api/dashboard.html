@@ -69,6 +69,7 @@
   }
 
   * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
 
   body {
     margin: 0;
@@ -404,6 +405,7 @@
   let silenced = new Set();
   const silencedAt = new Map();   // device -> when it went quiet (client clock)
   const noticedAfter = new Map(); // device -> seconds the system took to react
+  const inFlight = new Set();     // devices with a control request outstanding
 
   // ------------------------------------------------------------- rendering
 
@@ -417,51 +419,116 @@
     $("link-text").textContent = text;
   }
 
+  // Device rows are built once and patched in place, keyed by device id.
+  //
+  // The obvious implementation -- rebuild innerHTML on every update -- has a
+  // bug that took a while to see: a click needs mousedown and mouseup on the
+  // same element, so replacing the row between them swallows it. With the
+  // "silent for Ns" counter re-rendering four times a second, the revive
+  // button was being destroyed under the pointer and the button looked dead.
+  // Darkening still worked, because nothing is counting up until something has
+  // been silenced. That asymmetry was the whole clue.
+  const rows = new Map();
+
+  function deviceRow(id) {
+    let row = rows.get(id);
+    if (row) return row;
+
+    const root = document.createElement("div");
+    root.className = "device";
+    root.innerHTML = `
+      <div class="id"></div>
+      <div class="meta"></div>
+      <div class="acts">
+        <span class="tag state"></span>
+        <span class="tag silent" hidden>not answering</span>
+        <span class="tag leased" hidden>leased</span>
+        <button type="button" hidden></button>
+      </div>
+      <div class="note" hidden></div>
+      <div class="lag" hidden></div>`;
+
+    row = {
+      root,
+      id: root.querySelector(".id"),
+      meta: root.querySelector(".meta"),
+      state: root.querySelector(".tag.state"),
+      silent: root.querySelector(".tag.silent"),
+      leased: root.querySelector(".tag.leased"),
+      button: root.querySelector("button"),
+      note: root.querySelector(".note"),
+      lag: root.querySelector(".lag"),
+    };
+    row.id.textContent = id;
+    rows.set(id, row);
+    return row;
+  }
+
   function renderDevices(devices) {
     $("d-count").textContent = devices.length ? `${devices.length} in inventory` : "";
     const host = $("devices");
+
     if (!devices.length) {
       host.innerHTML = '<p class="empty">no devices</p>';
+      rows.clear();
       return;
     }
-    host.innerHTML = devices.map((d) => {
-      const state = escape(d.state);
+    if (host.querySelector(".empty")) host.innerHTML = "";
+
+    const present = new Set();
+
+    for (const d of devices) {
+      present.add(d.id);
+      const row = deviceRow(d.id);
+      if (row.root.parentNode !== host) host.appendChild(row.root);
+
       const quiet = silenced.has(d.id);
       const physical = d.transport !== "virtual";
 
-      const control = demoControls && physical
-        ? `<button type="button" class="${quiet ? "" : "danger"}" data-act="${quiet ? "revive" : "darken"}" data-id="${escape(d.id)}">${quiet ? "revive" : "stop answering"}</button>`
-        : "";
+      row.root.classList.toggle("silenced", quiet);
+      row.meta.textContent =
+        `${d.transport} · ${d.model || "—"}` +
+        (d.recoveries ? ` · ${d.recoveries} recover${d.recoveries === 1 ? "y" : "ies"}` : "");
 
-      // The whole point of the demo lives in this line: a silenced phone stays
-      // ONLINE and assignable until the health monitor catches up, and the
-      // console says how long that has been rather than looking frozen.
-      let lag = "";
+      row.state.textContent = d.state;
+      row.state.className = `tag state ${d.state}`;
+      row.silent.hidden = !quiet;
+      row.leased.hidden = !d.leased;
+
+      row.note.hidden = !d.note;
+      if (d.note) row.note.textContent = d.note;
+
+      // The gap this console exists to show: a silenced phone stays ONLINE and
+      // assignable until the health monitor works it out on its own.
       if (quiet && d.state === "online") {
         const since = silencedAt.get(d.id);
         const secs = since ? ((Date.now() - since) / 1000).toFixed(1) : "?";
-        lag = `<div class="lag">silent for ${secs}s — the system has not noticed yet</div>`;
+        row.lag.textContent = `silent for ${secs}s — the system has not noticed yet`;
+        row.lag.hidden = false;
       } else if (noticedAfter.has(d.id)) {
-        lag = `<div class="lag">the system noticed after ${noticedAfter.get(d.id)}s</div>`;
+        row.lag.textContent = `the system noticed after ${noticedAfter.get(d.id)}s`;
+        row.lag.hidden = false;
+      } else {
+        row.lag.hidden = true;
       }
 
-      return `
-        <div class="device${quiet ? " silenced" : ""}">
-          <div class="id">${escape(d.id)}</div>
-          <div class="meta">
-            ${escape(d.transport)} · ${escape(d.model || "—")}
-            ${d.recoveries ? ` · ${d.recoveries} recover${d.recoveries === 1 ? "y" : "ies"}` : ""}
-          </div>
-          <div class="acts">
-            <span class="tag ${state}">${state}</span>
-            ${quiet ? '<span class="tag silent">not answering</span>' : ""}
-            ${d.leased ? '<span class="tag leased">leased</span>' : ""}
-            ${control}
-          </div>
-          ${d.note ? `<div class="note">${escape(d.note)}</div>` : ""}
-          ${lag}
-        </div>`;
-    }).join("");
+      if (!demoControls || !physical) {
+        row.button.hidden = true;
+      } else {
+        row.button.hidden = false;
+        // Owned here rather than by the click handler, because the periodic
+        // repaint would otherwise re-enable a button mid-request.
+        row.button.disabled = inFlight.has(d.id);
+        row.button.dataset.id = d.id;
+        row.button.dataset.act = quiet ? "revive" : "darken";
+        row.button.textContent = quiet ? "revive" : "stop answering";
+        row.button.className = quiet ? "" : "danger";
+      }
+    }
+
+    for (const [id, row] of rows) {
+      if (!present.has(id)) { row.root.remove(); rows.delete(id); }
+    }
   }
 
   function renderTasks(tasks) {
@@ -631,12 +698,13 @@
 
     const id = button.dataset.id;
     const act = button.dataset.act;
+    if (inFlight.has(id)) return;
 
     // Acknowledge before the round trip. The server-side effect is invisible
     // for seconds by design -- the health monitor has to find out on its own --
     // and a button that looks like it did nothing for that long reads as
     // broken, which is the one thing this demo must not do.
-    button.disabled = true;
+    inFlight.add(id);
     if (act === "darken") {
       silenced.add(id);
       silencedAt.set(id, Date.now());
@@ -648,11 +716,17 @@
     }
     renderDevices(inventory);
 
-    await post(`demo/devices/${encodeURIComponent(id)}/${act}`);
+    try {
+      await post(`demo/devices/${encodeURIComponent(id)}/${act}`);
+    } finally {
+      inFlight.delete(id);
+      renderDevices(inventory);
+    }
   });
 
-  // Re-render often enough for the "silent for Ns" counter to tick. The
-  // inventory is a handful of rows, so this costs nothing.
+  // Ticks the "silent for Ns" counter. Safe to run this often only because
+  // renderDevices patches existing nodes instead of replacing them -- the
+  // version that rebuilt innerHTML ate every click on the revive button.
   setInterval(() => { if (silencedAt.size) renderDevices(inventory); }, 250);
 
   // The socket gives immediacy; the poll gives correctness. Both run.

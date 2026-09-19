@@ -9,7 +9,7 @@ working unattended, and reports progress over WebSocket.
 ```bash
 python cli.py demo                    # full run: no install, no adb, no Appium, no browser
 python cli.py deploy --fake           # APK rollout across a fleet, no phone needed
-python -m unittest discover -s tests  # 70 tests, ~5s
+python -m unittest discover -s tests  # 72 tests, ~5s
 
 pip install -r requirements.txt       # only `serve` needs anything
 python cli.py serve --fake            # live console on http://127.0.0.1:8080/
@@ -325,6 +325,16 @@ and the difference is visible:
 | a phone with work on it | the task fails and blames the device | ~0.4s |
 | an idle phone | the health probe misses twice | ~4s |
 
+**The rows are patched, not rebuilt — and that is a correctness issue, not a
+performance one.** The counter above needs a repaint a few times a second, and
+the first version got it by reassigning the list's `innerHTML`. A click needs
+mousedown and mouseup on the *same* element, so rebuilding the row between them
+swallows it: the revive button was being destroyed four times a second and did
+nothing when clicked. The asymmetry was the clue — *stop answering* worked
+fine, because nothing is counting up until something has been silenced. Rows are
+now keyed by device id and their fields updated in place, and a test fails if
+anyone reintroduces the wholesale rebuild.
+
 **Operator actions share the timeline with the system's reactions.** Darkening a
 device publishes a `demo.darkened` event — not as a state change, but so the
 feed can answer "did I cause that, or did it just happen?", which is the first
@@ -479,7 +489,7 @@ api/server.py           FastAPI routes -- the only module that imports FastAPI
 api/dashboard.html      the live console: one file, no build step, no CDN
 api/ws.py               EventHub, bounded fan-out, heartbeats
 obs/log.py              JSON formatter, correlation-id context
-tests/                  70 tests, mostly failure paths and layering rules
+tests/                  72 tests, mostly failure paths and layering rules
 .github/workflows/      tests + demo + rollout + booted API on 3.11-3.13, and a
                         job that installs nothing at all
 ```
